@@ -74,11 +74,9 @@ df = pd.DataFrame(klines, columns=[
 ])
 
 # === 4. Format the data ===
-df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')                           #convert from milliseconds to datetime object
-df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')                         #convert from milliseconds to datetime object
 df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
 
-df.drop(columns=['quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
+df.drop(columns=['close_time', 'open_time', 'quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
 
 
 # ---- 5. Add technical indicators ---- #
