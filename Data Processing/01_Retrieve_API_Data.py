@@ -5,7 +5,6 @@ import pandas as pd
 import pandas_ta as ta
 import datetime as dt
 import time
-import
 
 # === 1. Initialize API client ===
 # You can use an API key if you have one, or leave them blank for public dat
@@ -33,19 +32,19 @@ while True:
     # Binance will only send you the earliest 1000 candles that fit that interval.
 
     # CHANGED: use client.klines() instead of get_historical_klines()
-    for attempt in range(5):
-        try:
-            new_klines = client.klines(
-                symbol=symbol,
-                interval=interval,
-                startTime=int(start_time.timestamp() * 1000),
-                endTime=int(end_time.timestamp() * 1000),
-                limit=1000
-            )
-        except requests.exceptions.ConnectionError as e:
-            print(f"Connection error (attempt {attempt+1}/5): {e}")
-            time.sleep(3)
-        raise RuntimeError("Failed to reconnect after 5 attempts.")
+    #for attempt in range(5):
+        #try:
+    new_klines = client.klines(
+        symbol=symbol,
+        interval=interval,
+        startTime=int(start_time.timestamp() * 1000),
+        endTime=int(end_time.timestamp() * 1000),
+        limit=1000
+    )
+        #except requests.exceptions.ConnectionError as e:
+        #    print(f"Connection error (attempt {attempt+1}/5): {e}")
+        #    time.sleep(3)
+        #raise RuntimeError("Failed to reconnect after 5 attempts.")
 
     
 
@@ -76,8 +75,6 @@ df = pd.DataFrame(klines, columns=[
 # === 4. Format the data ===
 df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
 
-df.drop(columns=['close_time', 'open_time', 'quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
-
 
 # ---- 5. Add technical indicators ---- #
 RSI_length = 14
@@ -101,6 +98,7 @@ NaNrows_df = df[df.isna().any(axis=1)]  # DataFrame of rows with NaNs
 print(f"Number of rows with NaN values: {len(NaNrows_df)}")
 
 df.dropna(inplace=True)  # Remove rows with NaN values
+df.drop(columns=['close_time', 'open_time', 'quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
 
 
 # === 5. Save to CSV ===

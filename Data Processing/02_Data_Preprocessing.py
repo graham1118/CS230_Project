@@ -124,7 +124,7 @@ def create_batches(X, Y, batch_size):
         end = start + batch_size
         X_batches.append(X[start:end])
         Y_batches.append(Y[start:end])
-    return X_batches, Y_batches
+    return np.array(X_batches), np.array(Y_batches)
 
 X_train_batches, Y_train_batches = create_batches(X_train, Y_train, batch_size)
 X_val_batches, Y_val_batches = create_batches(X_val, Y_val, batch_size)
