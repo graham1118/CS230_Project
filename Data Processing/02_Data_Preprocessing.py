@@ -7,16 +7,22 @@ sequence_length = 128
 seed = 42
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
 batch_size = 128  # must be power of 2 for efficient training
-#column_names = ["open", "high", "low", "close", "volume", "RSI_14", "BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0", "BBB_20_2.0", "BBP_20_2.0"]
+#original_column_names = ["open", "high", "low", "close", "close_time", "volume", "RSI_14", "BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0", "BBB_20_2.0", "BBP_20_2.0"]
 
 
 # 1) Load data from CSV
 df = pd.read_csv('BTCUSDT_30m_10years.csv')
+
+### Print basic information about the dataset
 print(f"Loaded {len(df)} rows from CSV")
 print(f"Columns: {df.columns.tolist()}")
 df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
 print(f"Date range: {df['close_time'].min().strftime('%m/%d/%Y')} to {df['close_time'].max().strftime('%m/%d/%Y')}")  #print data range in MM/DD/YYYY format
+### 
 
+
+### Convert DataFrame to numpy array ###
+# We will use all columns except 'close_time' for training, so we can drop it. But, we still can retreive the timestamps later for plotting
 column_names = df.columns.tolist()
 column_names.remove('close_time')  # all columns except close_time
 print(f"Using columns: {column_names}")
@@ -50,24 +56,18 @@ arr = df[new_column_names].to_numpy(dtype=float)
 ### ---- 3) Compute log returns to normalize data ---- ###
 # Taking returns centers the timeseries around 1. Taking log returns centers around 0 and improves stability of training.
 
-# print(np.min(arr[:,0]), np.min(arr[:,1]), np.min(arr[:,2]), np.min(arr[:,3]), np.min(arr[:,4]))
-# print(np.max(arr[:,0]), np.max(arr[:,1]), np.max(arr[:,2]), np.max(arr[:,3]), np.max(arr[:,4]))
-# print(np.mean(arr[:,0]), np.mean(arr[:,1]), np.mean(arr[:,2]), np.mean(arr[:,3]), np.mean(arr[:,4]))
 log_returns = np.log(arr[1:, :4] / arr[:-1, :4])  # log returns of 'close' price
 log_returns = np.vstack([np.zeros((1, 4)), log_returns])  # first return is 0
 arr_norm = np.concatenate([log_returns[:, :4], arr[:, 4:]], axis=1)  # combine log returns and normalized indicators
 
 
 
-#Plan: divide the time series into non-overlapping contiguous "superblocks" (each >= window_size), 
-# generate all overlapping sequences inside each block, then randomly shuffle the list of blocks and
-# assign whole blocks to train/val/test. This yields (1) overlapping sequences within a set (max examples) 
-# and (2) no overlap across sets (no leakage), and (3) each set samples blocks from across the whole history 
-# because we shuffle blocks before splitting.
 
 print("\n#####################################################\n")
 
 #### ---- 4) Split Data into Train/Val/Test ---- ####
+
+#We do this before sequencing to ensure that there is no data leakage
 train_size = int(len(arr) * train_frac)
 val_size = int(len(arr) * val_frac)
 test_size = len(arr) - train_size - val_size
@@ -75,6 +75,9 @@ test_size = len(arr) - train_size - val_size
 train_set = arr[:train_size]
 val_set = arr[train_size:train_size + val_size]
 test_set = arr[train_size + val_size:]
+
+
+
 
 
 #### ---- 5) Sequence Data with no-overlap between sets ---- ####
@@ -85,8 +88,6 @@ def sequence(data, window, predict_n_points_into_future):
     X = np.stack([data[i:i+window] for i in starts], axis=0)
     Y = np.stack([data[i+window + predict_n_points_into_future] for i in starts], axis=0)
     return X, Y
-
-
 
 X_train, Y_train = sequence(train_set, sequence_length, predict_n_points_into_future)
 X_val, Y_val = sequence(train_set, sequence_length, predict_n_points_into_future)
@@ -99,26 +100,6 @@ print(f"Val set fraction: {X_val.shape[0]/(X_train.shape[0]+X_val.shape[0]+X_tes
 print(f"Test set fraction: {X_test.shape[0]/(X_train.shape[0]+X_val.shape[0]+X_test.shape[0]):.3f}")
 print("Each row of X is 1 input sequence of length:", X_train.shape[1])
 print("\n#####################################################\n")
-
-
-#### ---- 5) Pad sets to be multiple of `window_size` ---- #### 
-# def pad_to_multiple(X, Y, batch_size, rng=None):
-#     """Pad X and Y with random examples to make number of examples a multiple of `multiple`."""
-#     n = X.shape[0]
-#     if n % batch_size == 0:
-#         return X, Y
-#     if rng is None:
-#         rng = np.random.default_rng()
-#     n_pad = batch_size - (n % batch_size)
-#     p = rng.integers(0, n, size=n_pad)
-#     X_pad, Y_pad = X[p], Y[p]
-#     X_padded = np.concatenate([X, X_pad], axis=0)
-#     Y_padded = np.concatenate([Y, Y_pad], axis=0)
-#     return X_padded, Y_padded
-
-# X_train, Y_train = pad_to_multiple(X_train, Y_train, batch_size, rng)
-# X_val, Y_val = pad_to_multiple(X_val, Y_val, batch_size, rng)
-# X_test, Y_test = pad_to_multiple(X_test, Y_test, batch_size, rng)
 
 
 
@@ -138,7 +119,8 @@ def create_batches(X, Y, batch_size):
         X_batches.append(X[start:end])
         Y_batches.append(Y[start:end])
 
-    Last_X_batch = X_batches[-1]
+    #we must store the last batch separately, because it may be smaller than batch_size, and so numpy can't convert it to an array
+    Last_X_batch = X_batches[-1] 
     Last_Y_batch = Y_batches[-1]
     X_batches.pop()
     Y_batches.pop()
