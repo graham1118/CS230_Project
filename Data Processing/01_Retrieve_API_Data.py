@@ -98,9 +98,10 @@ NaNrows_df = df[df.isna().any(axis=1)]  # DataFrame of rows with NaNs
 print(f"Number of rows with NaN values: {len(NaNrows_df)}")
 
 df.dropna(inplace=True)  # Remove rows with NaN values
-df.drop(columns=['close_time', 'open_time', 'quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
+df.drop(columns=['open_time', 'quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
+#df.rename(columns={"close_time": "close_time_UNIX"})
 
 
 # === 5. Save to CSV ===
-df.to_csv('BTCUSDT_30m_10years.csv', index=True)
+df.to_csv('BTCUSDT_30m_10years.csv', index=False)
 print(f"Saved {len(df)} rows to BTCUSDT_30m_10years.csv")
