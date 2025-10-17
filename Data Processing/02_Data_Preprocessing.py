@@ -63,6 +63,8 @@ arr_norm = np.concatenate([log_returns[:, :4], arr[:, 4:]], axis=1)  # combine l
 
 
 
+
+
 print("\n#####################################################\n")
 
 #### ---- 4) Split Data into Train/Val/Test ---- ####
@@ -78,8 +80,6 @@ test_set = arr[train_size + val_size:]
 
 
 
-
-
 #### ---- 5) Sequence Data with no-overlap between sets ---- ####
 def sequence(data, window, predict_n_points_into_future):
     """Return list of (X, Y) for all overlapping sequences of length `window`."""
@@ -90,8 +90,8 @@ def sequence(data, window, predict_n_points_into_future):
     return X, Y
 
 X_train, Y_train = sequence(train_set, sequence_length, predict_n_points_into_future)
-X_val, Y_val = sequence(train_set, sequence_length, predict_n_points_into_future)
-X_test, Y_test = sequence(train_set, sequence_length, predict_n_points_into_future)
+X_val, Y_val = sequence(val_set, sequence_length, predict_n_points_into_future)
+X_test, Y_test = sequence(test_set, sequence_length, predict_n_points_into_future)
 
 
 print(f"Number of examples in train/val/test = {X_train.shape[0]}/{X_val.shape[0]}/{X_test.shape[0]}")
