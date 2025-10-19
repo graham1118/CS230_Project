@@ -1,0 +1,10 @@
+log_return_open
+log_return_high
+log_return_low
+log_return_close
+volume
+RSI_14
+BB_width
+BB_position
+MACDh_12_26_9
+SMA_14
