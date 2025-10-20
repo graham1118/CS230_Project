@@ -5,7 +5,7 @@ import sys
 import matplotlib.pyplot as plt
 
 ### Parameters ###
-sequence_length = 128
+sequence_length = 32
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
 batch_size = 256  # must be power of 2 for efficient training
 HORIZON = 2
@@ -92,6 +92,10 @@ test_set = arr[train_size + val_size:]
 # compute mean and std per feature (axis=0 → column-wise)
 mu = np.mean(train_set, axis=0)
 sigma = np.std(train_set, axis=0) + EPS  # avoid divide-by-zero
+
+mu_sigma = {"mu": mu, "sigma": sigma}
+mu_sigma_df = pd.DataFrame(mu_sigma)
+mu_sigma_df.to_csv("mu_sigma_df.csv", header=True)
 
 print("Train raw stds:", np.std(train_set, axis=0))
 print("Val raw stds:", np.std(val_set, axis=0))

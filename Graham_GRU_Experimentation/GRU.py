@@ -12,6 +12,39 @@ from typing import Tuple
 import time
 
 
+# ============================================================
+# Configuration
+# ============================================================
+results_save_path = "exp_results.pkl"
+plot_save_path_suffix = "_loss_plot.jpg"
+NPZ_PATH = "../Data Processing/preprocessed_data.npz"  # produced by your preprocessing script
+COL_NAMES_PATH = "../Data Processing/column_names.csv"
+SAVE_PATH = "cur_best_model.pth"
+SEED = 0 
+
+# ============================================================
+# Hyperparameters 
+# ============================================================
+"""
+Try:
+1) Different SEQ_LENs 
+2) Different HORIZONs
+3) Different NUM_GRU_LAYERS
+4) Different LEARNING_RATEs
+"""
+
+INIT_LEARNING_RATE = 1e-3          # smaller LR helps stability
+NUM_EPOCHS = 40
+NUM_GRU_LAYERS = 2
+GRU_HIDDEN_SIZE = 64
+CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
+MAX_LR = 1e-3
+MODEL_TO_USE = 'GRU' #or 'LSTM'
+WEIGHT_DECAY = 0
+DROPOUT = 0.10 #note used
+USE_SCHEDULER = False    # ReduceLROnPlateau on val loss
+
+
 
 # ----------------------------
 # Kernel, Files & Reproducibility
@@ -38,42 +71,6 @@ def seed_everything(seed):   #ensures randomness is fixed across runs
 
 
 
-
-# ============================================================
-# Configuration
-# ============================================================
-results_save_path = "exp_results.pkl"
-plot_save_path_suffix = "_loss_plot.jpg"
-NPZ_PATH = "../Data Processing/preprocessed_data.npz"  # produced by your preprocessing script
-COL_NAMES_PATH = "../Data Processing/column_names.csv"
-SEED = 0 
-
-# ============================================================
-# Hyperparameters 
-# ============================================================
-"""
-Try:
-1) Different SEQ_LENs 
-2) Different HORIZONs
-3) Different NUM_GRU_LAYERS
-4) Different LEARNING_RATEs
-"""
-
-INIT_LEARNING_RATE = 1e-3          # smaller LR helps stability
-NUM_EPOCHS = 40
-NUM_GRU_LAYERS = 3
-GRU_HIDDEN_SIZE = 64
-CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
-MAX_LR = 1e-3
-
-WEIGHT_DECAY = 0
-DROPOUT = 0.10 #note used
-USE_SCHEDULER = False    # ReduceLROnPlateau on val loss
-
-
-
-
-
 # ============================================
 # Load & reshape preprocessed batches from NPZ
 # ============================================
@@ -87,6 +84,8 @@ def load_preprocessed_data(path=NPZ_PATH):
     with np.load(path) as data:
         dataset = {key: data[key] for key in data.files}
     return dataset
+def flatten_features_to_close(Y):
+    return  Y [..., 0].unsqueeze(-1)
 
 
 data = load_preprocessed_data()
@@ -101,12 +100,29 @@ Y_val_batches = data["Y_val_batches"]
 X_test_batches = data["X_test_batches"]
 Y_test_batches = data["Y_test_batches"]
 
+print("[INFO] Converting data to torch tensors and moving to device...")
+X_train_batches = torch.from_numpy(X_train_batches).to(torch.float32).to(device)
+Y_train_batches = torch.from_numpy(Y_train_batches).to(torch.float32).to(device)
+X_val_batches = torch.from_numpy(X_val_batches).to(torch.float32).to(device)
+Y_val_batches   = torch.from_numpy(Y_val_batches).to(torch.float32).to(device)
+X_test_batches  = torch.from_numpy(X_test_batches).to(torch.float32).to(device)
+Y_test_batches  = torch.from_numpy(Y_test_batches).to(torch.float32).to(device)
+
+
+
+#set target to be only close price, rather than all features
+# Y_train_batches = flatten_features_to_close(Y_train_batches)
+# Y_val_batches = flatten_features_to_close(Y_val_batches)
+# Y_test_batches = flatten_features_to_close(Y_test_batches)
+
+
 num_train_batches = X_train_batches.shape[0]
 num_val_batches = X_val_batches.shape[0]
 num_test_batches = X_test_batches.shape[0]
 BATCH_SIZE = X_train_batches.shape[1]  #assumes all batches have same size
 SEQ_LEN = X_train_batches.shape[2]
 NUM_FEATURES = X_train_batches.shape[3]
+GRU_OUTPUT_SIZE = Y_train_batches.shape[-1]
 
 
 print("############### META INFO ####################")
@@ -119,16 +135,17 @@ print("Training Y shape:", Y_train_batches.shape)
 print(f"batch_size = {BATCH_SIZE}, seq_len = {SEQ_LEN}, num_features = {NUM_FEATURES}")
 print("##############################################\n\n")
 
-print("######## SANITY CHECK: CONFIRM NORMS #########")
-# Flatten across batch and batch_size dimensions
-X_flat = X_train_batches.reshape(-1, X_train_batches.shape[2], X_train_batches.shape[3])  # shape: (num_batches*batch_size, seq_len, num_features)
-X_unique = X_flat.reshape(-1, X_train_batches.shape[3])  # shape: (total_timesteps, num_features)
-feature_means = np.mean(X_unique, axis=0)
-feature_stds = np.std(X_unique, axis=0)
-print("feature means", [f"{x:.3f}" for x in feature_means])
-print("feature_stds", [f"{x:.3f}" for x in feature_stds])
-print("these won't be exactly 0 or 1 because they are only for one batch, not all of them")
-print("##############################################\n\n")
+# print("######## SANITY CHECK: CONFIRM NORMS #########")
+# # Flatten across batch and batch_size dimensions
+# X_flat = X_train_batches.reshape(-1, X_train_batches.shape[2], X_train_batches.shape[3])  # shape: (num_batches*batch_size, seq_len, num_features)
+# X_unique = X_flat.reshape(-1, X_train_batches.shape[3])  # shape: (total_timesteps, num_features)
+# feature_means = np.mean(X_unique, axis=0)
+# feature_stds = np.std(X_unique, axis=0)
+# print("feature means", [f"{x:.3f}" for x in feature_means])
+# print("feature_stds", [f"{x:.3f}" for x in feature_stds])
+# print("these won't be exactly 0 or 1 because they are only for one batch, not all of them")
+# print("##############################################\n\n")
+
 
 # print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
 # sys.exit(0)
@@ -148,17 +165,20 @@ print("##############################################\n\n")
 #At its simplest, an encoder is just a linear layer that maps the input to a higher-dimensional space.
 #A more complex encoder could involve multiple layers, non-linear activations, etc.
 
-# class GRU(nn.Module):
-#     def __init__(self, input_size, hidden_size, output_size, num_layers=NUM_GRU_LAYERS):
-#         super(GRU, self).__init__()
-#         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
-#         self.fc = nn.Linear(hidden_size, output_size)
 
-#     def forward(self, x):
-#         out, _ = self.gru(x)
-#         out = self.fc(out[:, -1, :])  # use last timestep output
-#         return out
 
+
+class GRU(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=NUM_GRU_LAYERS):
+        super(GRU, self).__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = self.fc(out[:, -1, :])  # use last timestep output
+        #out = self.fc(out.mean(dim=1))
+        return out
 
 class LSTM(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=NUM_GRU_LAYERS):
@@ -175,23 +195,10 @@ class LSTM(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
-   
 
-#model = GRU(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=Y_train_batches.shape[-1], num_layers=NUM_GRU_LAYERS)
-model = LSTM(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=Y_train_batches.shape[-1], num_layers=NUM_GRU_LAYERS)
 
-criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=INIT_LEARNING_RATE) # Optimizes the params in model.parameters(), and already has beta_1, beta_2, eps defaults set
-scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    optimizer,
-    max_lr=MAX_LR,
-    epochs=NUM_EPOCHS,
-    steps_per_epoch=X_train_batches.shape[0],
-    pct_start=0.3,            # e.g., 30% of cycle increasing
-    anneal_strategy='cos',    # cosine decrease after peak
-    div_factor=25.0,          # initial LR = max_lr/div_factor
-    final_div_factor=1e4      # final LR ~ max_lr/final_div_factor
-)
+
+
 
 # ==========================
 # Evaluation Functions
@@ -226,14 +233,15 @@ def compute_set_metrics(model, X, Y, device="cpu"):
     # iterate across leading dimension (num_batches or N)
     for xb, yb in zip(X, Y):
         pr = model(xb)
+       
 
         abs_sum += float((pr - yb).abs().sum().item())
         sq_sum  += float(((pr - yb) ** 2).sum().item())
         n_samples += pr.numel()
 
         # Directional accuracy
-        pred_sign = torch.sign(pr)
-        true_sign = torch.sign(yb)
+        pred_sign = torch.sign(pr[:,0])
+        true_sign = torch.sign(yb[:,0])
         mask = (true_sign != 0)
         correct += int((pred_sign[mask] == true_sign[mask]).sum().item())
         total += int(mask.sum().item())
@@ -246,33 +254,10 @@ def compute_set_metrics(model, X, Y, device="cpu"):
 
 @torch.no_grad()
 def compute_set_loss(model, X, Y, loss_func, device="cpu"):
-    """
-    Compute total and average loss over an entire dataset (possibly pre-batched).
-    
-    Works with inputs of any shape, as long as:
-        - X[i] and Y[i] are batch-aligned (same leading dimensions)
-        - model(X[i]) and Y[i] are broadcastable for the given loss function
 
-    Args:
-        model (nn.Module): Trained PyTorch model.
-        X (array-like or tensor): Input data of shape (..., batch_size, seq_len, num_features)
-        Y (array-like or tensor): Target data of shape (..., batch_size, num_features)
-        loss_func: PyTorch loss function (e.g. nn.MSELoss()).
-        device (str): "cpu" or "cuda" or "mps".
-
-    Returns:
-        avg_loss (float): Average loss over all examples.
-        total_loss (float): Sum of all batch losses.
-    """
     model.eval()
     total_loss = 0.0
     num_samples = 0
-
-    # Convert NumPy arrays to torch tensors if needed
-    if isinstance(X, np.ndarray):
-        X = torch.tensor(X, dtype=torch.float32)
-    if isinstance(Y, np.ndarray):
-        Y = torch.tensor(Y, dtype=torch.float32)
 
     X, Y = X.to(device), Y.to(device)
 
@@ -286,7 +271,29 @@ def compute_set_loss(model, X, Y, loss_func, device="cpu"):
     avg_loss = total_loss / max(1, num_samples)
     return avg_loss, total_loss
 
+@torch.no_grad()
+def compute_set_loss_close(model, X, Y, loss_func, device="cpu"):
+    """
+    Compute total and average loss over the dataset, 
+    but only for the first feature of the model's output.
+    """
+    model.eval()
+    total_loss = 0.0
+    num_samples = 0
 
+    X, Y = X.to(device), Y.to(device)
+
+    # Iterate over leading dimension (batches)
+    for xb, yb in zip(X, Y):
+        pr = model(xb)                    # Forward pass
+        pr_first = pr[..., 0].unsqueeze(-1)  # keep only first feature
+        yb_first = yb[..., 0].unsqueeze(-1)
+        loss = loss_func(pr_first, yb_first)  # Compute batch loss
+        total_loss += float(loss.item()) * xb.shape[0]
+        num_samples += xb.shape[0]
+
+    avg_loss = total_loss / max(1, num_samples)
+    return avg_loss, total_loss
 # ==========================
 # Training / evaluation loop
 # ==========================
@@ -315,20 +322,11 @@ def train_model(
     # --- Epoch loop ---
     for epoch in range(num_epochs):
         model.train()
-        running_loss = 0.0
-        running_mae = 0.0
-        running_rmse = 0.0
-        running_sign_acc = 0.0
-        num_batches = 0
 
         # === Train over all batches ===
         for xb, yb in zip(X_train, Y_train):
-            
-            xb = torch.tensor(xb, dtype=torch.float32, device=device)
-            yb = torch.tensor(yb, dtype=torch.float32, device=device)
-
             # xb shape is (batch_size, seq_len, num_features)
-            # yb shape is (batch_size, num_features)
+            # yb shape is (batch_size, 1)
 
             xb, yb = xb.to(device), yb.to(device) #nothing changes if device is CPU
             optimizer.zero_grad()
@@ -349,6 +347,17 @@ def train_model(
                 # print very small grads
                 if gn < 1e-8:
                     print(f"[tiny grad] {name}: {gn:.2e}")
+
+            # PRINT GRADIENT NORMS FOR DEBUGGING
+            # grad_norm = 0
+            # for p in model.parameters():
+            #     if p.grad is not None:
+            #         grad_norm += p.grad.detach().norm().item() ** 2
+            # grad_norm = grad_norm ** 0.5
+            # print(f"Grad norm: {grad_norm:.4e}")
+
+            if scheduler is not None:
+                scheduler.step() #not epoch-based, but val-loss based
            
 
 
@@ -363,8 +372,7 @@ def train_model(
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        if scheduler is not None:
-            scheduler.step() #not epoch-based, but val-loss based
+       
 
         print(
             f"Epoch {epoch+1:02d}/{num_epochs} | "
@@ -393,14 +401,29 @@ if __name__ == "__main__":
 
 
 
-    # 3) Torch tensors
-    print("[INFO] Converting data to torch tensors and moving to device...")
-    X_train_batches_torch = torch.from_numpy(X_train_batches).to(torch.float32).to(device)
-    Y_train_batches_torch = torch.from_numpy(Y_train_batches).to(torch.float32).to(device)
-    X_val_batches_torch   = torch.from_numpy(X_val_batches).to(torch.float32).to(device)
-    Y_val_batches_torch   = torch.from_numpy(Y_val_batches).to(torch.float32).to(device)
-    X_test_batches_torch  = torch.from_numpy(X_test_batches).to(torch.float32).to(device)
-    Y_test_batches_torch  = torch.from_numpy(Y_test_batches).to(torch.float32).to(device)
+
+
+    if MODEL_TO_USE == 'GRU':
+        model = GRU(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=GRU_OUTPUT_SIZE, num_layers=NUM_GRU_LAYERS)
+    elif MODEL_TO_USE == 'LSTM':
+        model = LSTM(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=GRU_OUTPUT_SIZE, num_layers=NUM_GRU_LAYERS)
+    else: 
+        print("[ERROR] invalid model to use")
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=INIT_LEARNING_RATE) # Optimizes the params in model.parameters(), and already has beta_1, beta_2, eps defaults set
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=MAX_LR,
+        epochs=NUM_EPOCHS,
+        steps_per_epoch=X_train_batches.shape[0],
+        pct_start=0.3,            # e.g., 30% of cycle increasing
+        anneal_strategy='cos',    # cosine decrease after peak
+        div_factor=25.0,          # initial LR = max_lr/div_factor
+        final_div_factor=1e4      # final LR ~ max_lr/final_div_factor
+    )
+
+
 
 
     # 5) Train
@@ -410,10 +433,10 @@ if __name__ == "__main__":
         model,
         optimizer,
         criterion,
-        X_train_batches_torch,
-        Y_train_batches_torch,
-        X_val_batches_torch,
-        Y_val_batches_torch,
+        X_train_batches,
+        Y_train_batches,
+        X_val_batches,
+        Y_val_batches,
         num_epochs=NUM_EPOCHS,
         batch_size=BATCH_SIZE,
         device=device,
@@ -425,9 +448,23 @@ if __name__ == "__main__":
     mae_train, rmse_train, sign_acc_train = train_metrics
     mae_val, rmse_val, sign_acc_val = val_metrics
 
+    test_loss, _ = compute_set_loss(model, X_test_batches, Y_test_batches, criterion)
+    mae_test, rmse_test, sign_acc_test = compute_set_metrics(model, X_test_batches, Y_test_batches)
 
-    test_loss, _ = compute_set_loss(model, X_test_batches_torch, Y_test_batches_torch, criterion)
-    mae_test, rmse_test, sign_acc_test = compute_set_metrics(model, X_test_batches_torch, Y_test_batches_torch)
+
+
+
+    torch.save({
+        'epoch': NUM_EPOCHS,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'train_loss': train_losses[-1],
+        'val_loss': val_losses[-1],
+    }, SAVE_PATH)
+
+    print(f"✅ Model saved to {SAVE_PATH}")
+
 
 
 
