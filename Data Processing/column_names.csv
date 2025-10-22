@@ -3,17 +3,8 @@ log_return_high
 log_return_low
 log_return_close
 volume
-close_time
-number_of_trades
 RSI_14
-BBL_20_2.0_2.0
-BBM_20_2.0_2.0
-BBU_20_2.0_2.0
-BBB_20_2.0_2.0
-BBP_20_2.0_2.0
 BB_width
 BB_position
-MACD_12_26_9
 MACDh_12_26_9
-MACDs_12_26_9
 SMA_14

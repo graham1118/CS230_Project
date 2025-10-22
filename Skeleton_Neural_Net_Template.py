@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,11 +33,14 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
 
 
+
+
+
 # ============================================================
 # Configuration
 # ============================================================
 SEED = 0
-EPOCHS = 60
+EPOCHS = 20
 results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
 

@@ -1,3 +1,5 @@
+# Data preprocessing file:
+
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -5,10 +7,10 @@ import sys
 import matplotlib.pyplot as plt
 
 ### Parameters ###
-sequence_length = 32
+sequence_length = 16
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
-batch_size = 256  # must be power of 2 for efficient training
-HORIZON = 2
+batch_size = 128  # must be power of 2 for efficient training
+HORIZON = 1
 EPS = 1e-8
 TA_LENGTH = 14 #technical indicator window for TA library functions
 # ROLL_NORM_WINDOW = 50000  # only used for rolling normalization, which proves not to work well
@@ -24,6 +26,13 @@ TA_LENGTH = 14 #technical indicator window for TA library functions
 
 df = pd.read_csv('BTCUSDT_30m_10years.csv')
 df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
+
+START_DATE = pd.Timestamp('2022-01-01')  # change if you want a different cutoff
+df = (
+    df[df['close_time'] >= START_DATE]
+      .sort_values('close_time')
+      .reset_index(drop=True)
+)
 
 print(f"Loaded {len(df)} rows from CSV")
 print(f"Date range: {df['close_time'].min().strftime('%m/%d/%Y')} to {df['close_time'].max().strftime('%m/%d/%Y')}")  #print data range in MM/DD/YYYY format
@@ -58,12 +67,13 @@ df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_retur
 ### REMOVE UN-NEEDED COLUMNS ###
 close_times = df['close_time']
 close_times.to_csv('datapoint_timestamps.csv', index=True, header=True)
-df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
+
 
 df.drop(columns=['close_time', 'BBL_20_2.0_2.0', 'BBM_20_2.0_2.0', 'BBU_20_2.0_2.0', 'BBB_20_2.0_2.0', 'BBP_20_2.0_2.0'], inplace=True)
 df.drop(columns=['number_of_trades', 'MACD_12_26_9', 'MACDs_12_26_9'], inplace=True)
 
 df = df.iloc[33:,:] # ONLY use FOR MACD
+df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
 arr = df.to_numpy()
 
 # print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
@@ -196,7 +206,8 @@ def sequence(data, window, HORIZON):
     starts = np.arange(0, T - window - HORIZON)
     X = np.stack([data[i:i+window] for i in starts], axis=0)
     #Y = np.stack([data[i+window + HORIZON] - data[i + window - 1] for i in starts], axis=0) #for z-scored OHLC
-    Y = np.stack([data[i+window + HORIZON] for i in starts], axis=0) #for log returns
+    close_idx = df.columns.get_loc('log_return_close')
+    Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
     return X, Y
 
 print("Starting Sequencing...")

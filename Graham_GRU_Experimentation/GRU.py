@@ -1,3 +1,5 @@
+# GRU.py:
+
 import numpy as np
 import pandas as pd
 import torch
@@ -19,6 +21,7 @@ results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
 NPZ_PATH = "../Data Processing/preprocessed_data.npz"  # produced by your preprocessing script
 COL_NAMES_PATH = "../Data Processing/column_names.csv"
+MU_SIGMA_PATH = "../Data Processing/mu_sigma_df.csv"
 SAVE_PATH = "cur_best_model.pth"
 SEED = 0 
 
@@ -33,16 +36,16 @@ Try:
 4) Different LEARNING_RATEs
 """
 
-INIT_LEARNING_RATE = 1e-3          # smaller LR helps stability
-NUM_EPOCHS = 40
-NUM_GRU_LAYERS = 2
+INIT_LEARNING_RATE = 2e-4          # smaller LR helps stability
+NUM_EPOCHS = 150
+NUM_GRU_LAYERS = 1
 GRU_HIDDEN_SIZE = 64
 CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
-MAX_LR = 1e-3
+MAX_LR = 2e-3
 MODEL_TO_USE = 'GRU' #or 'LSTM'
-WEIGHT_DECAY = 0
+WEIGHT_DECAY = 1e-4
 DROPOUT = 0.10 #note used
-USE_SCHEDULER = False    # ReduceLROnPlateau on val loss
+USE_SCHEDULER = True    # ReduceLROnPlateau on val loss
 
 
 
@@ -71,6 +74,76 @@ def seed_everything(seed):   #ensures randomness is fixed across runs
 
 
 
+@torch.no_grad()
+def compute_extras(model, X, Y):
+    model.eval()
+    preds = []
+    trues = []
+    for xb, yb in zip(X, Y):
+        pr_resid = model(xb)
+        pr = pr_resid + xb[:, -1, close_idx].unsqueeze(-1)
+        # de-normalize close log-returns
+        pr = (pr[:, 0] * sigma[close_idx] + mu[close_idx]).detach().cpu()
+        yb = (yb[:, 0] * sigma[close_idx] + mu[close_idx]).detach().cpu()
+        preds.append(pr); trues.append(yb)
+    p = torch.cat(preds); t = torch.cat(trues)
+    p_mean, t_mean = p.mean(), t.mean()
+    p_std,  t_std  = p.std(unbiased=False), t.std(unbiased=False)
+    cov = ((p - p_mean) * (t - t_mean)).mean()
+    corr = float(cov / (p_std * t_std + 1e-12))
+    mse = float(((p - t) ** 2).mean())
+    t_var = float(t.var(unbiased=False))  # population variance of true raw returns
+    r2 = float(1.0 - (mse / (t_var + 1e-12)))
+
+    return {
+        "pearson_r": corr,
+        "pred_std": float(p_std),
+        "true_std": float(t_std),
+        "pred_mean": float(p_mean),
+        "true_mean": float(t_mean),
+        "mse_raw": mse,
+        "r2_like": r2
+    }
+
+
+@torch.no_grad()
+def baseline_metrics_persistence(X, Y):
+    # predict that next return equals last observed close return in the sequence
+    correct = total = 0
+    abs_sum = sq_sum = 0.0
+    for xb, yb in zip(X, Y):
+        last_close = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
+        true_raw   = yb[:, 0] * sigma[close_idx] + mu[close_idx]
+        pred_raw   = last_close
+        # MSE/MAE on raw
+        abs_sum += float((pred_raw - true_raw).abs().sum().item())
+        sq_sum  += float(((pred_raw - true_raw)**2).sum().item())
+        # sign acc
+        mask = (true_raw != 0)
+        correct += int((torch.sign(pred_raw[mask]) == torch.sign(true_raw[mask])).sum().item())
+        total   += int(mask.sum().item())
+    n = X.shape[0] * X.shape[1]
+    return abs_sum/n, (sq_sum/n)**0.5, correct/max(1,total)
+
+@torch.no_grad()
+def baseline_metrics_zero(Y):
+    # predict zero return
+    abs_sum = sq_sum = 0.0
+    correct = total = 0
+    for yb in Y:
+        true_raw = yb[:, 0] * sigma[close_idx] + mu[close_idx]
+        pred_raw = torch.zeros_like(true_raw)
+        abs_sum += float((pred_raw - true_raw).abs().sum().item())
+        sq_sum  += float(((pred_raw - true_raw)**2).sum().item())
+        mask = (true_raw != 0)
+        correct += int((torch.sign(pred_raw[mask]) == torch.sign(true_raw[mask])).sum().item())
+        total   += int(mask.sum().item())
+    n = Y.shape[0] * Y.shape[1]
+    return abs_sum/n, (sq_sum/n)**0.5, correct/max(1,total)
+
+
+
+
 # ============================================
 # Load & reshape preprocessed batches from NPZ
 # ============================================
@@ -89,7 +162,18 @@ def flatten_features_to_close(Y):
 
 
 data = load_preprocessed_data()
-feature_names = pd.read_csv(COL_NAMES_PATH)
+with open(COL_NAMES_PATH, "r", encoding="utf-8", errors="ignore") as f:
+    txt = f.read()
+feature_names = [x.strip().strip("[]'\"") for x in txt.replace("\n", ",").split(",") if x.strip()]
+
+# --- load normalization stats and close index ---
+_ms = pd.read_csv(MU_SIGMA_PATH)
+mu = torch.tensor(_ms["mu"].to_numpy(), dtype=torch.float32, device=device)
+sigma = torch.tensor(_ms["sigma"].to_numpy(), dtype=torch.float32, device=device)
+close_idx = feature_names.index("log_return_close")
+
+print("[Sanity] close_idx =", close_idx)
+print("[Sanity] mu_close, sigma_close =", float(mu[close_idx]), float(sigma[close_idx]))
 
 X_train_batches = data["X_train_batches"]
 Y_train_batches = data["Y_train_batches"]
@@ -122,7 +206,7 @@ num_test_batches = X_test_batches.shape[0]
 BATCH_SIZE = X_train_batches.shape[1]  #assumes all batches have same size
 SEQ_LEN = X_train_batches.shape[2]
 NUM_FEATURES = X_train_batches.shape[3]
-GRU_OUTPUT_SIZE = Y_train_batches.shape[-1]
+GRU_OUTPUT_SIZE = 1
 
 
 print("############### META INFO ####################")
@@ -171,7 +255,14 @@ print("##############################################\n\n")
 class GRU(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=NUM_GRU_LAYERS):
         super(GRU, self).__init__()
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.2 if num_layers > 1 else 0.0
+        )
+        self.layernorm = nn.LayerNorm(hidden_size)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
@@ -211,65 +302,55 @@ class LSTM(nn.Module):
 
 @torch.no_grad()
 def compute_set_metrics(model, X, Y, device="cpu"):
-    """
-    Compute MAE, RMSE, and directional accuracy for an entire dataset.
-    """
-    model.eval() # Set model to evaluation mode, must set back to train() at the start of each epoch
-
-    # Convert from NumPy if needed
-    if isinstance(X, np.ndarray):
-        X = torch.tensor(X, dtype=torch.float32)
-    if isinstance(Y, np.ndarray):
-        Y = torch.tensor(Y, dtype=torch.float32)
-
+    model.eval()
+    if isinstance(X, np.ndarray): X = torch.tensor(X, dtype=torch.float32)
+    if isinstance(Y, np.ndarray): Y = torch.tensor(Y, dtype=torch.float32)
     X, Y = X.to(device), Y.to(device)
 
     abs_sum = 0.0
-    sq_sum = 0.0
+    sq_sum  = 0.0
     correct = 0
-    total = 0
+    total   = 0
     n_samples = 0
 
-    # iterate across leading dimension (num_batches or N)
     for xb, yb in zip(X, Y):
-        pr = model(xb)
-       
+        pr_resid = model(xb)
+        pr = pr_resid + xb[:, -1, close_idx].unsqueeze(-1)
 
-        abs_sum += float((pr - yb).abs().sum().item())
-        sq_sum  += float(((pr - yb) ** 2).sum().item())
+
+        abs_sum  += float((pr - yb).abs().sum().item())
+        sq_sum   += float(((pr - yb) ** 2).sum().item())
         n_samples += pr.numel()
 
-        # Directional accuracy
-        pred_sign = torch.sign(pr[:,0])
-        true_sign = torch.sign(yb[:,0])
+        # --- sign accuracy on *raw* (de-normalized) close log-returns ---
+        pr_raw = pr[:, 0] * sigma[close_idx] + mu[close_idx]
+        yb_raw = yb[:, 0] * sigma[close_idx] + mu[close_idx]
+        pred_sign = torch.sign(pr_raw)
+        true_sign = torch.sign(yb_raw)
         mask = (true_sign != 0)
         correct += int((pred_sign[mask] == true_sign[mask]).sum().item())
-        total += int(mask.sum().item())
+        total   += int(mask.sum().item())
 
-    mae = abs_sum / max(1, n_samples)
-    rmse = (sq_sum / max(1, n_samples)) ** 0.5
-    sign_acc = (correct / total) if total > 0 else float("nan")
-
-    return mae, rmse, sign_acc
+    mae   = abs_sum / max(1, n_samples)
+    rmse  = (sq_sum / max(1, n_samples)) ** 0.5
+    sacc  = (correct / total) if total > 0 else float("nan")
+    return mae, rmse, sacc
 
 @torch.no_grad()
 def compute_set_loss(model, X, Y, loss_func, device="cpu"):
-
     model.eval()
     total_loss = 0.0
     num_samples = 0
-
     X, Y = X.to(device), Y.to(device)
-
-    # Iterate over leading dimension (batches)
     for xb, yb in zip(X, Y):
-        pr = model(xb)              # Forward pass
-        loss = loss_func(pr, yb)    # Compute batch loss
-        total_loss += float(loss.item()) * xb.shape[0] # scale by batch size
+        pr_resid = model(xb)
+        last = xb[:, -1, close_idx].unsqueeze(-1)
+        pr_full = pr_resid + last
+        loss = loss_func(pr_full, yb)
+        total_loss += float(loss.item()) * xb.shape[0]
         num_samples += xb.shape[0]
+    return total_loss / max(1, num_samples), total_loss
 
-    avg_loss = total_loss / max(1, num_samples)
-    return avg_loss, total_loss
 
 @torch.no_grad()
 def compute_set_loss_close(model, X, Y, loss_func, device="cpu"):
@@ -294,6 +375,25 @@ def compute_set_loss_close(model, X, Y, loss_func, device="cpu"):
 
     avg_loss = total_loss / max(1, num_samples)
     return avg_loss, total_loss
+
+
+class EarlyStopper:
+    def __init__(self, patience=8, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = float("inf")
+        self.count = 0
+
+    def step(self, val):
+        improved = val < (self.best - self.min_delta)
+        if improved:
+            self.best = val
+            self.count = 0
+        else:
+            self.count += 1
+        return self.count >= self.patience
+
+
 # ==========================
 # Training / evaluation loop
 # ==========================
@@ -319,65 +419,79 @@ def train_model(
     train_losses = []
     val_losses = []
 
+    USE_EARLY_STOP = False
+
+    early = EarlyStopper(patience=15, min_delta=1e-3)
+    best_state = None
+    best_val = float("inf")
+
     # --- Epoch loop ---
     for epoch in range(num_epochs):
         model.train()
+        epoch_t0 = time.time() 
 
-        # === Train over all batches ===
-        for xb, yb in zip(X_train, Y_train):
-            # xb shape is (batch_size, seq_len, num_features)
-            # yb shape is (batch_size, 1)
+        perm = torch.randperm(X_train.shape[0], device=device)
+        X_train_epoch, Y_train_epoch = X_train[perm], Y_train[perm]
 
-            xb, yb = xb.to(device), yb.to(device) #nothing changes if device is CPU
+        PRINT_EVERY = 100
+
+        for bi, (xb, yb) in enumerate(zip(X_train_epoch, Y_train_epoch), start=1):
+            xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
-
-            # Forward + Backprop
             pred = model(xb)
-            loss = loss_func(pred, yb)
+
+            if bi == 1:  # check first batch each epoch
+                # inside the training loop, replace the dbg block with:
+                with torch.no_grad():
+                    last = xb[:, -1, close_idx].unsqueeze(-1)
+                    out_std = pred.std().item()
+                    tgt_std = (yb - last).std().item()
+                    out_mean = pred.mean().item()
+                    print(f"    [dbg] out_std={out_std:.4f} tgt_std={tgt_std:.4f} out_mean={out_mean:.4e}")
+
+
+            last = xb[:, -1, close_idx].unsqueeze(-1)     # z-scored last close
+            target_resid = yb - last
+            loss = criterion(pred, target_resid)          # model predicts residual directly
+
+            y_hat = pred
             loss.backward()
-
-            ### inspect for vanishing gradient##### 
-            total_gn = 0.0
-            for name, p in model.named_parameters():
-                if p.grad is None: 
-                    continue
-                g = p.grad.detach()
-                gn = g.norm().item()
-                total_gn += gn**2
-                # print very small grads
-                if gn < 1e-8:
-                    print(f"[tiny grad] {name}: {gn:.2e}")
-
-            # PRINT GRADIENT NORMS FOR DEBUGGING
-            # grad_norm = 0
-            # for p in model.parameters():
-            #     if p.grad is not None:
-            #         grad_norm += p.grad.detach().norm().item() ** 2
-            # grad_norm = grad_norm ** 0.5
-            # print(f"Grad norm: {grad_norm:.4e}")
-
-            if scheduler is not None:
-                scheduler.step() #not epoch-based, but val-loss based
-           
-
-
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD_NORM)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()  # ← keep AFTER optimizer.step()
+                
 
+        CUTOFF = X_train.shape[0]
 
         # --- Compute average loss across batches for the epoch ---
-        train_loss, _ = compute_set_loss(model, X_train, Y_train, loss_func)
-        val_loss, _ = compute_set_loss(model, X_val, Y_val, loss_func)
+        dt = time.time() - epoch_t0 
+        train_loss, _ = compute_set_loss(model, X_train[:CUTOFF], Y_train[:CUTOFF], loss_func)
+        val_loss, _ = compute_set_loss(model, X_val[:CUTOFF], Y_val[:CUTOFF], loss_func)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-       
+        print(f"Epoch {epoch+1:02d}/{num_epochs} | Train Loss={train_loss:.4f} | "
+          f"Val Loss={val_loss:.4f} | time={dt:.1f}s")  
+        for param_group in optimizer.param_groups:
+            print(f"LR: {param_group['lr']:.6f}")
 
-        print(
-            f"Epoch {epoch+1:02d}/{num_epochs} | "
-            f"Train Loss={train_loss:.4f} | Val Loss={val_loss:.4f} | "
-        )
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if USE_EARLY_STOP:
+            if early.step(val_loss):
+                print(f"[EarlyStop] Stopped at epoch {epoch+1} with best val={best_val:.4f}")
+                break
+
+        if (epoch + 1) % 5 == 0:
+            ex = compute_extras(model, X_val, Y_val)
+            print(f"[Val/Extras@{epoch+1}] r={ex['pearson_r']:.3f} "
+                f"pred_std={ex['pred_std']:.4f} true_std={ex['true_std']:.4f} "
+                f"mse_raw={ex['mse_raw']:.2e}")
+
+
     
     # --- End of epoch loop ---
     mae_train, rmse_train, sign_acc_train = compute_set_metrics(model, X_train, Y_train)
@@ -385,6 +499,8 @@ def train_model(
     train_metrics = (mae_train, rmse_train, sign_acc_train)
     val_metrics = (mae_val, rmse_val, sign_acc_val)
 
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     # --- Return history and final metrics ---
     return train_losses, val_losses, train_metrics, val_metrics
@@ -411,16 +527,16 @@ if __name__ == "__main__":
         print("[ERROR] invalid model to use")
 
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=INIT_LEARNING_RATE) # Optimizes the params in model.parameters(), and already has beta_1, beta_2, eps defaults set
+    optimizer = torch.optim.AdamW(model.parameters(), lr=INIT_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=MAX_LR,
         epochs=NUM_EPOCHS,
         steps_per_epoch=X_train_batches.shape[0],
-        pct_start=0.3,            # e.g., 30% of cycle increasing
+        pct_start=0.2,            # e.g., 40% of cycle increasing
         anneal_strategy='cos',    # cosine decrease after peak
-        div_factor=25.0,          # initial LR = max_lr/div_factor
-        final_div_factor=1e4      # final LR ~ max_lr/final_div_factor
+        div_factor=10.0,          # initial LR = max_lr/div_factor
+        final_div_factor=1e3      # final LR ~ max_lr/final_div_factor
     )
 
 
@@ -479,7 +595,22 @@ if __name__ == "__main__":
     print(f"{'Train':<12}{train_losses[-1]:>10.4f}{mae_train:>12.4f}{rmse_train:>12.4f}{sign_acc_train:>12.3f}")
     print(f"{'Val':<12}{val_losses[-1]:>10.4f}{mae_val:>12.4f}{rmse_val:>12.4f}{sign_acc_val:>12.3f}")
     print(f"{'Test':<12}{test_loss:>10.4f}{mae_test:>12.4f}{rmse_test:>12.4f}{sign_acc_test:>12.3f}")
+    extras_test = compute_extras(model, X_test_batches, Y_test_batches)
+    print("[Extras/Test]", extras_test)
+
+    mae_pers, rmse_pers, sacc_pers = baseline_metrics_persistence(X_test_batches, Y_test_batches)
+    mae_zero, rmse_zero, sacc_zero = baseline_metrics_zero(Y_test_batches)
+    print(f"[Baseline Persistence]  MAE={mae_pers:.4f} RMSE={rmse_pers:.4f} SignAcc={sacc_pers:.3f}")
+    print(f"[Baseline Zero]         MAE={mae_zero:.4f} RMSE={rmse_zero:.4f} SignAcc={sacc_zero:.3f}")
     print("="*60 + "\n")
+
+    with torch.no_grad():
+        xb, yb = X_train_batches[0], Y_train_batches[0]
+        pr = model(xb)
+        print(f"[Sanity] pred_std={pr.std().item():.4f} target_std={yb.std().item():.4f}")
+
+    
+
 
     # -------------------- #
     # 3. Plot training and validation loss
