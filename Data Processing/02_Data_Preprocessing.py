@@ -136,7 +136,7 @@ def process_columns(df):
         log_returns = np.log(df.iloc[:, :4] / df.iloc[:, :4].shift(1)) # First 4 columns only (e.g., open, high, low, close)
         log_returns = log_returns.fillna(0)
         df.iloc[:,:4] = log_returns
-        df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_return_close'] + list(df.columns[4:])
+    df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_return_close'] + list(df.columns[4:])
 
 
 
@@ -148,7 +148,9 @@ def process_columns(df):
     if USE_MACD: df = df.iloc[33:,:] # ONLY use FOR MACD
     df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
     arr = df.to_numpy()
-    close_idx = (df.columns.get_loc('log_return_close') if not DENOISE else df.columns.get_loc('close'))
+    close_idx = df.columns.get_loc('log_return_close')
+
+    print(min(df['log_return_open']), min(df['log_return_high']), min(df['log_return_low']), min(df['log_return_close']))
 
     return df.columns.tolist(), arr, close_idx
 
@@ -199,8 +201,6 @@ def block_and_sequence(arr, BLOCK_SIZE, close_idx):
 
 #### Critical Steps: Sequence, Split, Normalize ####
 def sequence(data, window, HORIZON, close_idx):
-    if DENOISE:
-        window = window + 1 #We'll have to take the log returns, which will shorten the sequence by 1
     
     T = data.shape[0]
     starts = np.arange(0, T - window - HORIZON)
@@ -208,9 +208,10 @@ def sequence(data, window, HORIZON, close_idx):
     
     #######################
     if DENOISE:
-        X = np.stack([swt_denoise_multifeature(seq) for seq in X], axis=0) #DENOISE
-        X = np.log((X[:, 1:, :] + EPS) / (X[:, :-1, :] + EPS)) # COMPUTE LOG RETURNS
-
+        #print(np.any(np.isnan(X)), np.any(np.isinf(X)), np.nanmax(X[:,:,:4]), np.nanmin(X[:,:,:4]))
+        X_denoised = swt_denoise_multifeature(X[:,:,:4]) #DENOISE
+        X = np.concatenate((X_denoised, X[:,:,4:]), axis=2)
+        X = np.log((X[:, 1:, :4] + EPS) / (X[:, :-1, :4] + EPS)) # COMPUTE LOG RETURNS
     #######################
    
     Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
@@ -373,7 +374,6 @@ if __name__ == '__main__':
     - BLOCK --> SEQUENCE BLOCKS --> SHUFFLE --> SPLIT --> NORM --> BATCH
     """
     if BLOCK_SHUFFLE:
-        
 
         blocked_Xs, blocked_Ys = block_and_sequence(arr, BLOCK_SIZE, close_idx)
 
@@ -427,15 +427,20 @@ if __name__ == '__main__':
             val = np.concatenate((val, val2), axis=0)
             test = np.concatenate((test, test2), axis=0)
 
-        
-        train, val, test = normalize_wrt_train(train, val, test)
-
-        verify_normalization(train, val, test) #prints out summary
+        if not DENOISE:
+            train, val, test = normalize_wrt_train(train, val, test)
+            verify_normalization(train, val, test) #prints out summary
             
         print("Starting Sequencing...")
         X_train, Y_train = sequence(train, SEQ_LEN, HORIZON, close_idx)
         X_val, Y_val =     sequence(val, SEQ_LEN, HORIZON, close_idx)
         X_test, Y_test =   sequence(test, SEQ_LEN, HORIZON, close_idx)
+
+        if DENOISE:
+            X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
+            Y_train, Y_val, Y_test = normalize_wrt_train(Y_train, Y_val, Y_test)
+            verify_normalization(train, val, test) #prints out summary
+
 
     
 

@@ -21,7 +21,7 @@ results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
 
 COMBINE_DATA = False
-BLOCK_SHUFFLE = True
+BLOCK_SHUFFLE = False
 
 NPZ_FNAME = fname = f"preprocessed_data{'_COMBINED' if COMBINE_DATA else ''}{'_SHUFFLED' if BLOCK_SHUFFLE else ''}.npz"
 
