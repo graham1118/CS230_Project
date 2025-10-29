@@ -2,38 +2,36 @@
 # CHANGED: import Spot instead of Client
 from binance.spot import Spot
 import pandas as pd
+import numpy as np
 import pandas_ta as ta
 import datetime as dt
 import time
+import sys
 
 # === 1. Initialize API client ===
-# You can use an API key if you have one, or leave them blank for public dat
 key_name = "cs230_project"
-api_key = '4xBdatBvCG4RIJKKjwFJy5HVVV9CM4TamudtrWTETWaA2Vomeb1dRcyADoTbtqd9'
-api_secret = 'LWxNl18AJpRrRy4o23jxJnB556FMikyMOHegYQp9PCF7kU69qVzsVWB3ojNg95LP'
-
-# CHANGED: Initialize Spot client with base_url for Binance.US
+api_key = str(np.loadtxt("/Users/g-ram/Documents/CS230_Project_Binance_Public_Key.txt", dtype=str))
+api_secret = str(np.loadtxt("/Users/g-ram/Documents/CS230_Project_Binance_Private_Key.txt", dtype=str))
 client = Spot(api_key=api_key, api_secret=api_secret, base_url='https://api.binance.us')
 
+
+
 # === 2. Set parameters ===
-symbol = 'BTCUSDT'
-interval = '30m'  # CHANGED: Spot client uses strings, not constants
-end_time = dt.datetime.now() #Ocotber 12, 2025 @ 5:00 PM PST
-start_time = end_time - dt.timedelta(days=365 * 10)  # 10 years ago
+symbol = 'ETHUSDT' #select BTCUSDT or ETHUSDT
+interval = '30m' 
+years_of_data = 10
+end_time = dt.datetime.now() #October 12, 2025 @ 5:00 PM PST
+start_time = end_time - dt.timedelta(days=365 * years_of_data)  # 10 years ago
 
-#Fix end_time as the current time.
+
+
 # Progressively march start time forward by 1000 points until start time >= end time, then stop.
-
 klines = []
 num_calls = 0                                                                         #keep track of the number of API calls made
 while True:
     # Fetch candles
-    # No matter how wide the time range you specify with start_str and end_str,
-    # Binance will only send you the earliest 1000 candles that fit that interval.
+    # No matter how wide the time range you specify with start_str and end_str, binance will only send you the earliest 1000 candles that fit that interval.
 
-    # CHANGED: use client.klines() instead of get_historical_klines()
-    #for attempt in range(5):
-        #try:
     new_klines = client.klines(
         symbol=symbol,
         interval=interval,
@@ -41,13 +39,7 @@ while True:
         endTime=int(end_time.timestamp() * 1000),
         limit=1000
     )
-        #except requests.exceptions.ConnectionError as e:
-        #    print(f"Connection error (attempt {attempt+1}/5): {e}")
-        #    time.sleep(3)
-        #raise RuntimeError("Failed to reconnect after 5 attempts.")
-
     
-
     print(f"API Call #{num_calls}: Fetched {len(new_klines)} candles starting from {start_time}")
     
     if not new_klines:                                                                 # Stop if no more data is returned
@@ -87,11 +79,14 @@ df = pd.concat([df, bbands], axis=1)
 
 
 
-
 # ---- 6. Resize DataFrame to remove initial NaN values from indicators ---- #
+orig_len = len(df)
 df = df.iloc[max_length:].reset_index(drop=True)
-print(f"DataFrame resized to {len(df)} rows after removing initial NaN values from indicators.")
-print(f"Date range: {df['open_time'].min()} to {df['open_time'].max()}")                          
+print(f"\n\nDataFrame resized from {orig_len} to {len(df)} rows after removing initial NaN values from indicators.")
+first_datapoint = dt.datetime.fromtimestamp(df['open_time'].min() / 1000).strftime("%Y-%m-%d %H:%M:%S")
+last_datapoint = dt.datetime.fromtimestamp(df['open_time'].max() / 1000).strftime("%Y-%m-%d %H:%M:%S")
+print(f"Date range: {first_datapoint} to {last_datapoint}")                          
+
 
 df_without_NaNs = df.copy()  # Keep a copy without NaNs for reference
 NaNrows_df = df[df.isna().any(axis=1)]  # DataFrame of rows with NaNs
@@ -99,9 +94,9 @@ print(f"Number of rows with NaN values: {len(NaNrows_df)}")
 
 df.dropna(inplace=True)  # Remove rows with NaN values
 df.drop(columns=['open_time', 'quote_asset_volume', 'taker_buy_base', 'taker_buy_quote', 'ignore'], inplace=True)
-#df.rename(columns={"close_time": "close_time_UNIX"})
 
 
 # === 5. Save to CSV ===
-df.to_csv('BTCUSDT_30m_10years.csv', index=False)
-print(f"Saved {len(df)} rows to BTCUSDT_30m_10years.csv")
+filename_to_save = f'{symbol}_{interval}_{years_of_data}years.csv'
+df.to_csv(filename_to_save, index=False)
+print(f"Saved {len(df)} rows to {filename_to_save}")

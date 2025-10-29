@@ -19,7 +19,13 @@ import time
 # ============================================================
 results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
-NPZ_PATH = "../Data Processing/preprocessed_data.npz"  # produced by your preprocessing script
+
+COMBINE_DATA = False
+BLOCK_SHUFFLE = True
+
+NPZ_FNAME = fname = f"preprocessed_data{'_COMBINED' if COMBINE_DATA else ''}{'_SHUFFLED' if BLOCK_SHUFFLE else ''}.npz"
+
+NPZ_PATH = f"../Data Processing/{NPZ_FNAME}"  # produced by your preprocessing script
 COL_NAMES_PATH = "../Data Processing/column_names.csv"
 MU_SIGMA_PATH = "../Data Processing/mu_sigma_df.csv"
 SAVE_PATH = "cur_best_model.pth"
@@ -44,7 +50,7 @@ CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
 MAX_LR = 2e-3
 MODEL_TO_USE = 'GRU' #or 'LSTM'
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.10 #note used
+DROPOUT = 0.0 #note used
 USE_SCHEDULER = True    # ReduceLROnPlateau on val loss
 
 
@@ -71,7 +77,6 @@ def seed_everything(seed):   #ensures randomness is fixed across runs
     random.seed(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-
 
 
 @torch.no_grad()
@@ -516,9 +521,6 @@ if __name__ == "__main__":
     print("[INFO] Looking for NPZ at:", os.path.abspath(NPZ_PATH))
 
 
-
-
-
     if MODEL_TO_USE == 'GRU':
         model = GRU(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=GRU_OUTPUT_SIZE, num_layers=NUM_GRU_LAYERS)
     elif MODEL_TO_USE == 'LSTM':
@@ -528,12 +530,15 @@ if __name__ == "__main__":
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=INIT_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    steps_per_epoch = X_train_batches.shape[0]
+    total_steps = steps_per_epoch * NUM_EPOCHS
+
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=MAX_LR,
-        epochs=NUM_EPOCHS,
-        steps_per_epoch=X_train_batches.shape[0],
-        pct_start=0.2,            # e.g., 40% of cycle increasing
+        total_steps=total_steps,
+        pct_start=0.1,            # e.g., 40% of cycle increasing
         anneal_strategy='cos',    # cosine decrease after peak
         div_factor=10.0,          # initial LR = max_lr/div_factor
         final_div_factor=1e3      # final LR ~ max_lr/final_div_factor

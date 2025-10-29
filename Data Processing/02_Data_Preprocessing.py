@@ -5,134 +5,484 @@ import pandas as pd
 import pandas_ta as ta
 import sys
 import matplotlib.pyplot as plt
+import pywt
 
 ### Parameters ###
-sequence_length = 16
-train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
-batch_size = 128  # must be power of 2 for efficient training
-HORIZON = 1
+SEED = 42
+rng = np.random.default_rng(seed=SEED)
+
+#### Can be any combination of True/False ####
+COMBINE_DATA = False
+BLOCK_SHUFFLE = False 
+DENOISE = True
+#############################################
+
+BLOCK_SIZE = 4096
+HORIZON = 2
 EPS = 1e-8
 TA_LENGTH = 14 #technical indicator window for TA library functions
-# ROLL_NORM_WINDOW = 50000  # only used for rolling normalization, which proves not to work well
+SELECT_RANGE = False #used if you want to select a later range of the data, rather than all of it
+USE_MACD = True
+SEQ_LEN = 16
+train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
+batch_size = 128  # must be power of 2 for efficient training
+
+
+
+#### WAVELET DENOISING ####
+def swt_denoise_multifeature(X, wavelet='db4', level=3, mode='soft', c=0.7):
+    """
+    Perform stationary wavelet transform (SWT) denoising on multivariate sequences.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Shape (num_sequences, seq_len, num_features)
+    wavelet : str
+        Wavelet type (e.g. 'db4', 'sym5', etc.)
+    level : int
+        Decomposition level for SWT
+    mode : {'soft', 'hard'}
+        Thresholding mode
+    c : float
+        Scaling factor for universal threshold (e.g., 0.5–1.0)
+
+    Returns
+    -------
+    denoised : np.ndarray
+        Denoised array of same shape as X
+    """
+    num_sequences, seq_len, num_features = X.shape
+    denoised = np.zeros_like(X)
+
+    for f in range(num_features):
+        # apply per feature across all sequences at once
+        for s in range(num_sequences):
+            x = X[s, :, f]
+            coeffs = pywt.swt(x, wavelet=wavelet, level=level)
+            # coeffs is a list of (cA, cD) pairs for each level
+            cA, details = coeffs[-1][0], [c[1] for c in coeffs]
+
+            # Estimate noise σ from finest detail level
+            d1 = details[-1]
+            sigma = np.median(np.abs(d1)) / 0.6745
+            lam = c * sigma * np.sqrt(2 * np.log(len(x)))
+
+            # Threshold all detail coefficients
+            coeffs_thresh = [
+                (cA_j, pywt.threshold(cD_j, lam, mode=mode))
+                for (cA_j, cD_j) in coeffs
+            ]
+
+            # Reconstruct
+            x_rec = pywt.iswt(coeffs_thresh, wavelet)
+            denoised[s, :, f] = x_rec
+
+    return denoised
+
+"""
+ - DO NOT denoise volume or num trades - spikes are signal!!
+ - DO NOT denoise technical indicators - they are already pretty smooth
+ - DO NOT DENOISE Y labels
+ - Denoise OHLC. Maybe try only denoising Close (not Open, High, Low, later on)
+ - denoise within each sequence. If you denoise the whole timeseries, one sequence has info about the next. 
+   During online inference, I'll only be able to denoise each sequence, not "future points" that give me a hint of what's to come.
+   Therefore, I should train like I test, practice like I play.
+ - Use stationary wavelet transform, keeps the same number of points
+ - for 'mode' (mode is used for padding), use periodization, it just wraps the signal around. 
+
+
+ !!! if DENOISE == True, don't take log returns until after sequencing. You'll lose 1 datapoint, but that's I accounted for this
+ !!! keep threshold_scale=0.7. This multiplies the Universtal Noise threshold, which is a bit too aggressive
+
+"""
+
+
+#### Initial Data Processing ####
+def load_data(fname):
+    df = pd.read_csv(fname)
+    df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
+
+    if SELECT_RANGE:
+        START_DATE = pd.Timestamp('2022-01-01')  # change if you want a different cutoff
+        df = (
+            df[df['close_time'] >= START_DATE]
+            .sort_values('close_time')
+            .reset_index(drop=True)
+        )
+
+    print(f"Loaded {len(df)} rows from CSV")
+    print(f"Date range: {df['close_time'].min().strftime('%m/%d/%Y')} to {df['close_time'].max().strftime('%m/%d/%Y')}")  #print data range in MM/DD/YYYY format
+    print(f"Original Columns: {df.columns.tolist()}\n\n")
+
+    return df
+
+def process_columns(df):
+    # Bollander Band Width and Position
+    df['BB_width'] =  (df['BBU_20_2.0_2.0'] - df['BBL_20_2.0_2.0']) / (df['BBM_20_2.0_2.0'] + 1e-8)
+    df['BB_position'] = (df['close'] - df['BBL_20_2.0_2.0']) / (df['BBU_20_2.0_2.0'] - df['BBL_20_2.0_2.0'] + 1e-8)
+
+    #MACD 
+    if USE_MACD:
+        macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
+        df = pd.concat([df, macd], axis=1)
+        df.drop(columns=[ 'MACD_12_26_9', 'MACDs_12_26_9'], inplace=True)
+
+    #Standard Moving Average
+    df["SMA_14"] = ta.sma(df["close"], length=14)  
+
+    # Taking returns centers the timeseries around 1. Taking log returns centers around 0 and improves stability of training.
+    if not DENOISE:
+        log_returns = np.log(df.iloc[:, :4] / df.iloc[:, :4].shift(1)) # First 4 columns only (e.g., open, high, low, close)
+        log_returns = log_returns.fillna(0)
+        df.iloc[:,:4] = log_returns
+        df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_return_close'] + list(df.columns[4:])
+
+
+
+    ### REMOVE UN-NEEDED COLUMNS ###
+    close_times = df['close_time']
+    close_times.to_csv('datapoint_timestamps.csv', index=True, header=True)
+    df.drop(columns=['close_time', 'BBL_20_2.0_2.0', 'BBM_20_2.0_2.0', 'BBU_20_2.0_2.0', 'BBB_20_2.0_2.0', 'BBP_20_2.0_2.0', 'number_of_trades'], inplace=True)
+
+    if USE_MACD: df = df.iloc[33:,:] # ONLY use FOR MACD
+    df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
+    arr = df.to_numpy()
+    close_idx = (df.columns.get_loc('log_return_close') if not DENOISE else df.columns.get_loc('close'))
+
+    return df.columns.tolist(), arr, close_idx
+
+
+#### Functions for Shuffling ####
+def block(arr, BLOCK_SIZE):
+    """
+    Accepts: (num_datapoints, num_features)-size numpy array and 
+    Returns: (num_blocks, block_size, num_features)-size numpy array, 
+    
+    Where num_blocks = floor(num_datapoints/block_size), and the remaining earlier datapoints (the earlier indices) are dropped
+    so that each block is the same size
+    """
+    num_datapoints, num_features = arr.shape
+    num_blocks = num_datapoints // BLOCK_SIZE  # floor division
+
+    # Drop the earlier datapoints so that we can evenly reshape
+    trimmed_arr = arr[-num_blocks * BLOCK_SIZE:, :]
+
+    # Reshape into blocks
+    blocked_data = trimmed_arr.reshape(num_blocks, BLOCK_SIZE, num_features)
+
+    return blocked_data
+
+def shuffle_blocks(X, Y):
+    perm = rng.permutation(len(X)) #ensures both get shuffled in the same way
+    return X[perm], Y[perm]
+
+def block_and_sequence(arr, BLOCK_SIZE, close_idx):
+    blocked_data = block(arr, BLOCK_SIZE=BLOCK_SIZE)
+    num_blocks, block_size, num_features = blocked_data.shape
+    num_sequences = block_size - SEQ_LEN - HORIZON
+    if num_sequences <= 0:
+        raise ValueError(f"BLOCK_SIZE ({BLOCK_SIZE}) must be > SEQ_LEN+HORIZON ({SEQ_LEN+HORIZON})")
+
+    blocked_Xs = np.zeros((num_blocks, num_sequences, SEQ_LEN, num_features)) #size (num_blocks, num_sequences, sequence_len, num_features)  
+    blocked_Ys = np.zeros((num_blocks, num_sequences, 1)) #size (num_blocks, num_sequences, 1) 
+
+    for i in range(num_blocks):
+        block_i = blocked_data[i, :, :]
+        block_X, block_Y = sequence(block_i, SEQ_LEN, HORIZON, close_idx)
+        blocked_Xs[i] = block_X
+        blocked_Ys[i] = block_Y
+
+    return blocked_Xs, blocked_Ys
+
+
+
+#### Critical Steps: Sequence, Split, Normalize ####
+def sequence(data, window, HORIZON, close_idx):
+    if DENOISE:
+        window = window + 1 #We'll have to take the log returns, which will shorten the sequence by 1
+    
+    T = data.shape[0]
+    starts = np.arange(0, T - window - HORIZON)
+    X = np.stack([data[i:i+window] for i in starts], axis=0) #shape (num_sequences, sequence_length, num_features)
+    
+    #######################
+    if DENOISE:
+        X = np.stack([swt_denoise_multifeature(seq) for seq in X], axis=0) #DENOISE
+        X = np.log((X[:, 1:, :] + EPS) / (X[:, :-1, :] + EPS)) # COMPUTE LOG RETURNS
+
+    #######################
+   
+    Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
+    return X, Y
+
+def split(array, train_frac, val_frac):
+    train_size = int(len(array) * train_frac)
+    val_size = int(len(array) * val_frac)
+
+    train_set = array[:train_size]
+    val_set = array[train_size:train_size + val_size]
+    test_set = array[train_size + val_size:]
+
+    return train_set, val_set, test_set
+
+def normalize_wrt_train(train, val, test, eps=1e-8):
+
+    """
+    Normalize datasets (train, val, test) using mean/std from training set only.
+    Works for arrays of shape:
+      - (N, F)
+      - (B, S, T, F)
+      - or anything else where the last axis is features.
+
+    Returns: normalized (train, val, test)
+    """
+    # Determine which axes to average over (all but last)
+    axes = tuple(range(train.ndim - 1))
+    
+    mu = np.mean(train, axis=axes, keepdims=True)
+    sigma = np.std(train, axis=axes, keepdims=True) + eps
+
+    train_norm = (train - mu) / sigma
+    val_norm   = (val   - mu) / sigma
+    test_norm  = (test  - mu) / sigma
+
+    return train_norm, val_norm, test_norm
+
+def verify_normalization(train_set, val_set, test_set):
+    print("number of features:", train_set.shape[1])
+    print("Train means:", [f"{x:.3f}" for x in np.mean(train_set, axis=0)])
+    print("Train stds: ", [f"{x:.3f}" for x in np.std(train_set, axis=0)])
+    print("Val means:  ", [f"{x:.3f}" for x in np.mean(val_set, axis=0)])
+    print("Val stds:   ", [f"{x:.3f}" for x in np.std(val_set, axis=0)])
+    print("Test means: ", [f"{x:.3f}" for x in np.mean(test_set, axis=0)])
+    print("Test stds:  ", [f"{x:.3f}" for x in np.std(test_set, axis=0)])
+    print('\n\n')
+
+
+
+#### Last step, Batching ####
+def create_batches(X, Y, batch_size):
+    """Return list of (X_batch, Y_batch) tuples."""
+    n = X.shape[0]
+    X_batches = []
+    Y_batches = []
+    Last_X_batch = None
+    Last_Y_batch = None
+    for start in range(0, n, batch_size):
+        end = start + batch_size
+        X_batches.append(X[start:end])
+        Y_batches.append(Y[start:end])
+
+    #we must store the last batch separately, because it may be smaller than batch_size, and so numpy can't convert it to an array
+    Last_X_batch = X_batches[-1] 
+    Last_Y_batch = Y_batches[-1]
+    X_batches.pop()
+    Y_batches.pop()
+    
+    return np.array(X_batches), np.array(Y_batches), np.array(Last_X_batch), np.array(Last_Y_batch)
+
+def summarize_batched_data(X_train_batches, Y_train_batches,
+                           X_val_batches,   Y_val_batches,
+                           X_test_batches,  Y_test_batches):
+    """
+    Summarizes batched datasets (train/val/test) by printing key info:
+    - number of batches
+    - batch size
+    - sequence length
+    - number of features
+    - number of total examples (excluding dropped last batch)
+    - relative fractions of each split
+    """
+
+    # Infer common dimensions from the first batch
+    batch_size, seq_len, num_features = X_train_batches[0].shape
+    num_batches_train = len(X_train_batches)
+    num_batches_val   = len(X_val_batches)
+    num_batches_test  = len(X_test_batches)
+
+    # Total examples (no last batch assumption)
+    n_train = num_batches_train * batch_size
+    n_val   = num_batches_val   * batch_size
+    n_test  = num_batches_test  * batch_size
+    total   = n_train + n_val + n_test
+
+    # Fractions
+    f_train = n_train / total
+    f_val   = n_val   / total
+    f_test  = n_test  / total
+
+    # ---- Pretty printing ----
+    print("\n" + "#"*65)
+    print(f"{'📊 DATA SUMMARY':^65}")
+    print("#"*65 + "\n")
+
+    print(f"Number of features: {num_features}")
+    print(f"Sequence length per example: {seq_len}")
+    print(f"Batch size: {batch_size}")
+    print()
+
+    print("Dataset Split Summary:")
+    print("-" * 65)
+    print(f"{'Set':<10}{'Num Batches':<15}{'Examples':<15}{'Fraction':<15}")
+    print("-" * 65)
+    print(f"{'Train':<10}{num_batches_train:<15}{n_train:<15}{f_train:<15.3f}")
+    print(f"{'Val':<10}{num_batches_val:<15}{n_val:<15}{f_val:<15.3f}")
+    print(f"{'Test':<10}{num_batches_test:<15}{n_test:<15}{f_test:<15.3f}")
+    print("-" * 65)
+
+    print("\nExample batch shapes:")
+    print(f"X_train_batches[0]: {X_train_batches[0].shape}, Y_train_batches[0]: {Y_train_batches[0].shape}")
+    print(f"X_val_batches[0]:   {X_val_batches[0].shape}, Y_val_batches[0]:   {Y_val_batches[0].shape}")
+    print(f"X_test_batches[0]:  {X_test_batches[0].shape}, Y_test_batches[0]:  {Y_test_batches[0].shape}")
+
+    print("\n" + "#"*65 + "\n")
+
+
+
+if __name__ == '__main__':
+
+    # ============================================================
+    # 1) Load data from CSV
+    # ============================================================
+    df = load_data('BTCUSDT_30m_10years.csv')
+
+    if COMBINE_DATA:
+        df2 = load_data('ETHUSDT_30m_10years.csv')
+
+    
+
+
+    # ============================================================
+    # 2) Add New Technical Indicators and compute log returns
+    # ============================================================
+    col_names, arr, close_idx = process_columns(df)
+    NUM_FEATURES = arr.shape[1]
+
+    if COMBINE_DATA:
+        col_names2, arr2, _ = process_columns(df2)
+
+    # print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
+    # sys.exit(0)
+    print("\n#####################################################\n")
+
+
+
+    """ 
+    If we shuffle blocks, we do:
+    - BLOCK --> SEQUENCE BLOCKS --> SHUFFLE --> SPLIT --> NORM --> BATCH
+    """
+    if BLOCK_SHUFFLE:
+        
+
+        blocked_Xs, blocked_Ys = block_and_sequence(arr, BLOCK_SIZE, close_idx)
+
+        if COMBINE_DATA:
+            blocked_Xs2, blocked_Ys2 = block_and_sequence(arr2, BLOCK_SIZE, close_idx)
+            combined_block_Xs = np.concatenate((blocked_Xs, blocked_Xs2), axis=0)
+            combined_block_Ys = np.concatenate((blocked_Ys, blocked_Ys2), axis=0)
+            shuffled_combined_blocked_Xs, shuffled_combined_blocked_Ys = shuffle_blocks(combined_block_Xs, combined_block_Ys)
+
+            X = shuffled_combined_blocked_Xs
+            Y = shuffled_combined_blocked_Ys
+
+        else: 
+            shuffled_blocked_Xs, shuffled_blocked_Ys = shuffle_blocks(blocked_Xs, blocked_Ys) # shuffled_blocked_Xs size (num_blocks, num_sequences, sequence_len, num_features)  
+                                                                                            # shuffled_blocked_Ys size (num_blocks, num_sequences, num_features)  
+            X = shuffled_blocked_Xs
+            Y = shuffled_blocked_Ys
+
+        #Each is (num_blocks, sequences_per_block, sequence_length, num_features)
+        X_train, X_val, X_test = split(X, train_frac, val_frac)
+        Y_train, Y_val, Y_test = split(Y, train_frac, val_frac)
+
+        #combine all blocks - they are no longer needed
+        #becomes (num_sequences, sequence_length, num_features)
+        X_train = X_train.reshape(-1, X_train.shape[2], X_train.shape[3])
+        Y_train = Y_train.reshape(-1, Y_train.shape[2])
+        X_val   = X_val.reshape(-1, X_val.shape[2], X_val.shape[3])
+        Y_val   = Y_val.reshape(-1, Y_val.shape[2])
+        X_test  = X_test.reshape(-1, X_test.shape[2], X_test.shape[3])
+        Y_test  = Y_test.reshape(-1, Y_test.shape[2])
+
+        X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
+        Y_train, Y_val, Y_test = normalize_wrt_train(Y_train, Y_val, Y_test)
+
+        print(X_train.shape, X_val.shape, X_test.shape)
+
+        """
+        if no shuffling, we do:
+        - SPLIT --> NORM --> SEQUENCE --> BATCH
+        """
+    else:
+        # ============================================================
+        # 4) Split, Normalize, and Sequence
+        # ============================================================
+        
+        train, val, test = split(arr, train_frac, val_frac)
+
+        if COMBINE_DATA:
+            train2, val2, test2 = split(arr2, train_frac, val_frac)
+            train = np.concatenate((train, train2), axis=0)
+            val = np.concatenate((val, val2), axis=0)
+            test = np.concatenate((test, test2), axis=0)
+
+        
+        train, val, test = normalize_wrt_train(train, val, test)
+
+        verify_normalization(train, val, test) #prints out summary
+            
+        print("Starting Sequencing...")
+        X_train, Y_train = sequence(train, SEQ_LEN, HORIZON, close_idx)
+        X_val, Y_val =     sequence(val, SEQ_LEN, HORIZON, close_idx)
+        X_test, Y_test =   sequence(test, SEQ_LEN, HORIZON, close_idx)
+
+    
+
+
+    # ============================================================
+    # 7) Create Batches of size `batch_size`
+    # ============================================================
+    print("starting batching...")
+
+    #Ignore last batches
+    X_train_batches, Y_train_batches, _, _ = create_batches(X_train, Y_train, batch_size)
+    X_val_batches, Y_val_batches, _, _ = create_batches(X_val, Y_val, batch_size)
+    X_test_batches, Y_test_batches, _, _ = create_batches(X_test, Y_test, batch_size)
+
+    summarize_batched_data(X_train_batches, Y_train_batches,
+                            X_val_batches,   Y_val_batches,
+                            X_test_batches,  Y_test_batches)
+
+    
+
+
+
+    # ============================================================
+    # 8) Save Data
+    # ============================================================
+    fname = f"preprocessed_data{'_COMBINED' if COMBINE_DATA else ''}{'_SHUFFLED' if BLOCK_SHUFFLE else ''}.npz"
+
+    np.savez_compressed(fname,
+        X_train_batches=X_train_batches, Y_train_batches=Y_train_batches,
+        X_val_batches=X_val_batches, Y_val_batches=Y_val_batches,
+        X_test_batches=X_test_batches, Y_test_batches=Y_test_batches,
+    )   
 
 
 
 
 
 
-# ============================================================
-# 1) Load data from CSV
-# ============================================================
-
-df = pd.read_csv('BTCUSDT_30m_10years.csv')
-df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-
-START_DATE = pd.Timestamp('2022-01-01')  # change if you want a different cutoff
-df = (
-    df[df['close_time'] >= START_DATE]
-      .sort_values('close_time')
-      .reset_index(drop=True)
-)
-
-print(f"Loaded {len(df)} rows from CSV")
-print(f"Date range: {df['close_time'].min().strftime('%m/%d/%Y')} to {df['close_time'].max().strftime('%m/%d/%Y')}")  #print data range in MM/DD/YYYY format
-print(f"Original Columns: {df.columns.tolist()}\n\n")
 
 
 
 
-# ============================================================
-# 2) Add New Technical Indicators and compute log returns
-# ============================================================
-
-# Bollander Band Width and Position
-df['BB_width'] =  (df['BBU_20_2.0_2.0'] - df['BBL_20_2.0_2.0']) / (df['BBM_20_2.0_2.0'] + 1e-8)
-df['BB_position'] = (df['close'] - df['BBL_20_2.0_2.0']) / (df['BBU_20_2.0_2.0'] - df['BBL_20_2.0_2.0'] + 1e-8)
-
-#MACD 
-macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-df = pd.concat([df, macd], axis=1)
-
-#Standard Moving Average
-df["SMA_14"] = ta.sma(df["close"], length=14)  
-
-# Taking returns centers the timeseries around 1. Taking log returns centers around 0 and improves stability of training.
-log_returns = np.log(df.iloc[:, :4] / df.iloc[:, :4].shift(1)) # First 4 columns only (e.g., open, high, low, close)
-log_returns = log_returns.fillna(0)
-df.iloc[:,:4] = log_returns
-df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_return_close'] + list(df.columns[4:])
 
 
 
-### REMOVE UN-NEEDED COLUMNS ###
-close_times = df['close_time']
-close_times.to_csv('datapoint_timestamps.csv', index=True, header=True)
 
 
-df.drop(columns=['close_time', 'BBL_20_2.0_2.0', 'BBM_20_2.0_2.0', 'BBU_20_2.0_2.0', 'BBB_20_2.0_2.0', 'BBP_20_2.0_2.0'], inplace=True)
-df.drop(columns=['number_of_trades', 'MACD_12_26_9', 'MACDs_12_26_9'], inplace=True)
-
-df = df.iloc[33:,:] # ONLY use FOR MACD
-df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
-arr = df.to_numpy()
-
-# print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
-# sys.exit(0)
-print("\n#####################################################\n")
-
-
-
-# ============================================================
-# 3) Split into train/val/test
-# ============================================================
-#We do this before sequencing to ensure that there is no data leakage
-train_size = int(len(arr) * train_frac)
-val_size = int(len(arr) * val_frac)
-test_size = len(arr) - train_size - val_size
-
-train_set = arr[:train_size]
-val_set = arr[train_size:train_size + val_size]
-test_set = arr[train_size + val_size:]
-
-
-# ============================================================
-# 4) Fit normalization stats on training set only
-# ============================================================
-
-# compute mean and std per feature (axis=0 → column-wise)
-mu = np.mean(train_set, axis=0)
-sigma = np.std(train_set, axis=0) + EPS  # avoid divide-by-zero
-
-mu_sigma = {"mu": mu, "sigma": sigma}
-mu_sigma_df = pd.DataFrame(mu_sigma)
-mu_sigma_df.to_csv("mu_sigma_df.csv", header=True)
-
-print("Train raw stds:", np.std(train_set, axis=0))
-print("Val raw stds:", np.std(val_set, axis=0))
-print("Test raw stds:", np.std(test_set, axis=0))
-
-def normalize(x, mu, sigma):
-    """Apply training-set normalization to a NumPy array."""
-    return (x - mu) / sigma
-
-train_set = normalize(train_set, mu, sigma)
-val_set   = normalize(val_set, mu, sigma)
-test_set  = normalize(test_set, mu, sigma)
-
-
-# ============================================================
-# 5) Verify normalization correctness
-# ============================================================
-
-print("current_columns", df.columns.tolist())
-print("number of features:", train_set.shape[1])
-print("Train means:", [f"{x:.3f}" for x in np.mean(train_set, axis=0)])
-print("Train stds: ", [f"{x:.3f}" for x in np.std(train_set, axis=0)])
-print("Val means:  ", [f"{x:.3f}" for x in np.mean(val_set, axis=0)])
-print("Val stds:   ", [f"{x:.3f}" for x in np.std(val_set, axis=0)])
-print("Test means: ", [f"{x:.3f}" for x in np.mean(test_set, axis=0)])
-print("Test stds:  ", [f"{x:.3f}" for x in np.std(test_set, axis=0)])
-print('\n\n')
 
 
 
@@ -192,95 +542,3 @@ print('\n\n')
 # plt.grid(True, linestyle='--', alpha=0.5)
 # plt.tight_layout()
 # plt.show()
-
-
-
-
-# ============================================================
-# 7) Sequence Data with no-overlap between sets
-# ============================================================
-
-def sequence(data, window, HORIZON):
-    """Return list of (X, Y) for all overlapping sequences of length `window`."""
-    T = data.shape[0]
-    starts = np.arange(0, T - window - HORIZON)
-    X = np.stack([data[i:i+window] for i in starts], axis=0)
-    #Y = np.stack([data[i+window + HORIZON] - data[i + window - 1] for i in starts], axis=0) #for z-scored OHLC
-    close_idx = df.columns.get_loc('log_return_close')
-    Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
-    return X, Y
-
-print("Starting Sequencing...")
-X_train, Y_train = sequence(train_set, sequence_length, HORIZON)
-X_val, Y_val = sequence(val_set, sequence_length, HORIZON)
-X_test, Y_test = sequence(test_set, sequence_length, HORIZON)
-print("Sequencing completed")
-
-print(f"Number of examples in train/val/test = {X_train.shape[0]}/{X_val.shape[0]}/{X_test.shape[0]}")
-print(f"Train set fraction: {X_train.shape[0]/(X_train.shape[0]+X_val.shape[0]+X_test.shape[0]):.3f}")
-print(f"Val set fraction: {X_val.shape[0]/(X_train.shape[0]+X_val.shape[0]+X_test.shape[0]):.3f}")
-print(f"Test set fraction: {X_test.shape[0]/(X_train.shape[0]+X_val.shape[0]+X_test.shape[0]):.3f}")
-print("Each row of X is 1 input sequence of length:", X_train.shape[1])
-print("\n#####################################################\n")
-
-
-
-
-
-
-# ============================================================
-# 8) Create Batches of size `batch_size`
-# ============================================================
-
-def create_batches(X, Y, batch_size):
-    """Return list of (X_batch, Y_batch) tuples."""
-    n = X.shape[0]
-    X_batches = []
-    Y_batches = []
-    Last_X_batch = None
-    Last_Y_batch = None
-    for start in range(0, n, batch_size):
-        end = start + batch_size
-        X_batches.append(X[start:end])
-        Y_batches.append(Y[start:end])
-
-    #we must store the last batch separately, because it may be smaller than batch_size, and so numpy can't convert it to an array
-    Last_X_batch = X_batches[-1] 
-    Last_Y_batch = Y_batches[-1]
-    X_batches.pop()
-    Y_batches.pop()
-    
-    return np.array(X_batches), np.array(Y_batches), np.array(Last_X_batch), np.array(Last_Y_batch)
-
-
-#Keep batches as python lists of arrays, so that the last batch can be smaller than batch_size if needed
-print("starting batching...")
-X_train_batches, Y_train_batches, Last_X_train_batch, Last_Y_train_batch = create_batches(X_train, Y_train, batch_size)
-X_val_batches, Y_val_batches, Last_X_val_batch, Last_Y_val_batch = create_batches(X_val, Y_val, batch_size)
-X_test_batches, Y_test_batches, Last_X_test_batch, Last_Y_test_batch = create_batches(X_test, Y_test, batch_size)
-
-#Print the number of batches in each set, the size of each batch, and the shape of each example
-print(f"train/val/test num batches = {len(X_train_batches)}/{len(X_val_batches)}/{len(X_test_batches)}")
-print(f"batch size = {batch_size}")
-
-#print the shape of each batch set
-print(f"X_train_batches shape: {X_train_batches[0].shape}, Y_train_batches shape: {Y_train_batches[0].shape}")
-print(f"X_val_batches shape: {X_val_batches[0].shape}, Y_val_batches shape: {Y_val_batches[0].shape}")
-print(f"X_test_batches shape: {X_test_batches[0].shape}, Y_test_batches shape: {Y_test_batches[0].shape}")
-print(f"Size of last batch in train/val/test = {Last_X_train_batch.shape[0]}/{Last_X_val_batch.shape[0]}/{Last_Y_test_batch.shape[0]}")
-print(f"Size of last batch")
-print("\n#####################################################\n")
-
-
-
-assert not np.array_equal(X_train[0, -1], Y_train[0]), "Off-by-one leak!"
-
-#### ---- 7) Save preprocessed data to .npz file ---- ####
-np.savez_compressed('preprocessed_data.npz',
-    X_train_batches=X_train_batches, Y_train_batches=Y_train_batches,
-    Last_X_train_batch=Last_X_train_batch, Last_Y_train_batch=Last_Y_train_batch,
-    X_val_batches=X_val_batches, Y_val_batches=Y_val_batches,
-    Last_X_val_batch=Last_X_val_batch, Last_Y_val_batch=Last_Y_val_batch,
-    X_test_batches=X_test_batches, Y_test_batches=Y_test_batches,
-    Last_X_test_batch=Last_X_test_batch, Last_Y_test_batch=Last_Y_test_batch,
-)   
