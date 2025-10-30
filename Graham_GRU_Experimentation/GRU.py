@@ -50,7 +50,7 @@ CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
 MAX_LR = 2e-3
 MODEL_TO_USE = 'GRU' #or 'LSTM'
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.0 #note used
+DROPOUT = 0.2 #note used
 USE_SCHEDULER = True    # ReduceLROnPlateau on val loss
 
 
@@ -236,9 +236,6 @@ print("##############################################\n\n")
 # print("##############################################\n\n")
 
 
-# print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
-# sys.exit(0)
-
 ############################################################################################################################################################################
 ############################################################################################################################################################################
 ############################################################################################################################################################################
@@ -249,31 +246,24 @@ print("##############################################\n\n")
 #  GRU for regression (scalar)
 # ==================================
 
-# Instantiate model. Hidden_size is the size of the hidden state vector, h_t. Seeting hidden_size > input_size allows model to learn more complex patterns, 
-# and is effectively equivalent to first passing the input through a linear layer (encoder) to increase its dimensionality before feeding it to the GRU.
-#At its simplest, an encoder is just a linear layer that maps the input to a higher-dimensional space.
-#A more complex encoder could involve multiple layers, non-linear activations, etc.
-
-
-
-
 class GRU(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=NUM_GRU_LAYERS):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
         super(GRU, self).__init__()
         self.gru = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=0.2 if num_layers > 1 else 0.0
+            dropout=DROPOUT if num_layers > 1 else 0.0
         )
-        self.layernorm = nn.LayerNorm(hidden_size)
+        self.batchnorm = nn.BatchNorm1d(hidden_size)  # normalize hidden features
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        out, _ = self.gru(x)
-        out = self.fc(out[:, -1, :])  # use last timestep output
-        #out = self.fc(out.mean(dim=1))
+        out, _ = self.gru(x)                    # [B, T, H]
+        out = out[:, -1, :]                     # last timestep [B, H]
+        out = self.batchnorm(out)               # normalize across batch
+        out = self.fc(out)
         return out
 
 class LSTM(nn.Module):
@@ -355,7 +345,6 @@ def compute_set_loss(model, X, Y, loss_func, device="cpu"):
         total_loss += float(loss.item()) * xb.shape[0]
         num_samples += xb.shape[0]
     return total_loss / max(1, num_samples), total_loss
-
 
 @torch.no_grad()
 def compute_set_loss_close(model, X, Y, loss_func, device="cpu"):

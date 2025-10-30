@@ -23,63 +23,100 @@ EPS = 1e-8
 TA_LENGTH = 14 #technical indicator window for TA library functions
 SELECT_RANGE = False #used if you want to select a later range of the data, rather than all of it
 USE_MACD = True
-SEQ_LEN = 16
+SEQ_LEN = 64
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
 batch_size = 128  # must be power of 2 for efficient training
 
 
 
 #### WAVELET DENOISING ####
-def swt_denoise_multifeature(X, wavelet='db4', level=3, mode='soft', c=0.7):
+def swt_denoise_multifeature(x, wavelet='db4', level=3, thresh_scale=0.7):
+    m = 2 ** level
+    target = int(np.ceil(len(x) / m) * m)
+    pad_len = target - len(x)
+
+    # pad on the right using last value
+    if pad_len > 0:
+        x_pad = np.pad(x, (0, pad_len), mode='edge')
+    else:
+        x_pad = x
+
+    coeffs = pywt.swt(x_pad, wavelet=wavelet, level=level)
+    d1 = coeffs[-1][1]
+    sigma = np.median(np.abs(d1)) / 0.6745
+    lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x_pad)))
+    coeffs_t = [(cA, pywt.threshold(cD, lam, mode='soft')) for (cA, cD) in coeffs]
+    x_rec = pywt.iswt(coeffs_t, wavelet)
+    return x_rec[:len(x)]  
+
+def dwt_denoise_multifeature(
+    X,                      # shape (num_sequences, seq_len, num_features)
+    wavelet='db4',
+    level=3,
+    thresh_scale=0.7,
+    soft_or_hard='soft',
+    mode='smooth',          # key difference from SWT
+    eps=1e-8
+):
     """
-    Perform stationary wavelet transform (SWT) denoising on multivariate sequences.
+    Perform multifeature denoising using DWT (causal-safe) with mode='smooth'.
+    Preserves sequence length via reconstruction (pywt.waverec).
 
     Parameters
     ----------
     X : np.ndarray
-        Shape (num_sequences, seq_len, num_features)
+        (num_sequences, seq_len, num_features)
     wavelet : str
-        Wavelet type (e.g. 'db4', 'sym5', etc.)
+        Wavelet basis (e.g. 'db4', 'bior1.3', etc.)
     level : int
-        Decomposition level for SWT
-    mode : {'soft', 'hard'}
-        Thresholding mode
-    c : float
-        Scaling factor for universal threshold (e.g., 0.5–1.0)
+        Decomposition level
+    thresh_scale : float
+        Multiplier for universal threshold
+    soft_or_hard : str
+        Thresholding mode ('soft' or 'hard')
+    mode : str
+        Edge mode passed to pywt.wavedec (default 'smooth')
+    eps : float
+        Small constant for numerical safety / clipping
 
     Returns
     -------
     denoised : np.ndarray
-        Denoised array of same shape as X
+        Same shape as X, length preserved.
     """
-    num_sequences, seq_len, num_features = X.shape
-    denoised = np.zeros_like(X)
+    num_seq, seq_len, num_feat = X.shape
+    out = np.empty_like(X, dtype=float)
 
-    for f in range(num_features):
-        # apply per feature across all sequences at once
-        for s in range(num_sequences):
-            x = X[s, :, f]
-            coeffs = pywt.swt(x, wavelet=wavelet, level=level)
-            # coeffs is a list of (cA, cD) pairs for each level
-            cA, details = coeffs[-1][0], [c[1] for c in coeffs]
+    for f in range(num_feat):
+        for s in range(num_seq):
+            x = X[s, :, f].astype(float)
 
-            # Estimate noise σ from finest detail level
-            d1 = details[-1]
-            sigma = np.median(np.abs(d1)) / 0.6745
-            lam = c * sigma * np.sqrt(2 * np.log(len(x)))
+            # --- Wavelet decomposition ---
+            coeffs = pywt.wavedec(x, wavelet=wavelet, level=level, mode=mode)
 
-            # Threshold all detail coefficients
-            coeffs_thresh = [
-                (cA_j, pywt.threshold(cD_j, lam, mode=mode))
-                for (cA_j, cD_j) in coeffs
+            # --- Estimate noise sigma from the finest detail ---
+            d1 = coeffs[-1]
+            sigma = np.median(np.abs(d1)) / 0.6745 + eps
+            lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x)))
+
+            # --- Threshold all detail coefficients ---
+            coeffs_thr = [coeffs[0]] + [
+                pywt.threshold(c, lam, mode=soft_or_hard) for c in coeffs[1:]
             ]
 
-            # Reconstruct
-            x_rec = pywt.iswt(coeffs_thresh, wavelet)
-            denoised[s, :, f] = x_rec
+            # --- Reconstruct ---
+            x_rec = pywt.waverec(coeffs_thr, wavelet=wavelet, mode=mode)
 
-    return denoised
+            # --- Crop or pad to original length ---
+            if len(x_rec) > len(x):
+                x_rec = x_rec[:len(x)]
+            elif len(x_rec) < len(x):
+                x_rec = np.pad(x_rec, (0, len(x) - len(x_rec)), mode='edge')
 
+            # --- Clip negatives before log ---
+            out[s, :, f] = np.clip(x_rec, eps, None)
+
+    return out
 """
  - DO NOT denoise volume or num trades - spikes are signal!!
  - DO NOT denoise technical indicators - they are already pretty smooth
@@ -113,7 +150,6 @@ def load_data(fname):
 
     print(f"Loaded {len(df)} rows from CSV")
     print(f"Date range: {df['close_time'].min().strftime('%m/%d/%Y')} to {df['close_time'].max().strftime('%m/%d/%Y')}")  #print data range in MM/DD/YYYY format
-    print(f"Original Columns: {df.columns.tolist()}\n\n")
 
     return df
 
@@ -149,8 +185,7 @@ def process_columns(df):
     df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
     arr = df.to_numpy()
     close_idx = df.columns.get_loc('log_return_close')
-
-    print(min(df['log_return_open']), min(df['log_return_high']), min(df['log_return_low']), min(df['log_return_close']))
+    print(f"Columns After Processing: {df.columns.tolist()}\n\n")
 
     return df.columns.tolist(), arr, close_idx
 
@@ -208,13 +243,21 @@ def sequence(data, window, HORIZON, close_idx):
     
     #######################
     if DENOISE:
-        #print(np.any(np.isnan(X)), np.any(np.isinf(X)), np.nanmax(X[:,:,:4]), np.nanmin(X[:,:,:4]))
-        X_denoised = swt_denoise_multifeature(X[:,:,:4]) #DENOISE
-        X = np.concatenate((X_denoised, X[:,:,4:]), axis=2)
-        X = np.log((X[:, 1:, :4] + EPS) / (X[:, :-1, :4] + EPS)) # COMPUTE LOG RETURNS
+        X_denoised = dwt_denoise_multifeature(X[:,:,:4])                                    # DENOISE
+        X_denoised = np.log((X_denoised[:, 1:, :4] + EPS) / (X_denoised[:, :-1, :4] + EPS)) # COMPUTE LOG RETURNS
+        X = np.concatenate((X_denoised, X[:,1:,4:]), axis=2)                                 # Add back with other features
     #######################
    
-    Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
+    #Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
+
+    #Use log returns for Y as well
+    future_closes = data[window + HORIZON : window + HORIZON + len(starts), close_idx]
+    past_closes   = data[window + HORIZON - 1 : window + HORIZON - 1 + len(starts), close_idx]
+
+    Y = np.log((future_closes + EPS) / (past_closes + EPS))
+    Y = Y[:, np.newaxis]
+    Y = Y*1000
+
     return X, Y
 
 def split(array, train_frac, val_frac):
@@ -228,22 +271,25 @@ def split(array, train_frac, val_frac):
     return train_set, val_set, test_set
 
 def normalize_wrt_train(train, val, test, eps=1e-8):
-
     """
     Normalize datasets (train, val, test) using mean/std from training set only.
     Works for arrays of shape:
       - (N, F)
+      - (N, T, F)
       - (B, S, T, F)
-      - or anything else where the last axis is features.
+    Normalization is applied feature-wise across *all* sequences and timesteps.
 
-    Returns: normalized (train, val, test)
+    Returns:
+        train_norm, val_norm, test_norm
     """
     # Determine which axes to average over (all but last)
     axes = tuple(range(train.ndim - 1))
-    
+
+    # Compute feature-wise mean/std using train set only
     mu = np.mean(train, axis=axes, keepdims=True)
     sigma = np.std(train, axis=axes, keepdims=True) + eps
 
+    # Apply normalization
     train_norm = (train - mu) / sigma
     val_norm   = (val   - mu) / sigma
     test_norm  = (test  - mu) / sigma
@@ -251,15 +297,25 @@ def normalize_wrt_train(train, val, test, eps=1e-8):
     return train_norm, val_norm, test_norm
 
 def verify_normalization(train_set, val_set, test_set):
-    print("number of features:", train_set.shape[1])
-    print("Train means:", [f"{x:.3f}" for x in np.mean(train_set, axis=0)])
-    print("Train stds: ", [f"{x:.3f}" for x in np.std(train_set, axis=0)])
-    print("Val means:  ", [f"{x:.3f}" for x in np.mean(val_set, axis=0)])
-    print("Val stds:   ", [f"{x:.3f}" for x in np.std(val_set, axis=0)])
-    print("Test means: ", [f"{x:.3f}" for x in np.mean(test_set, axis=0)])
-    print("Test stds:  ", [f"{x:.3f}" for x in np.std(test_set, axis=0)])
-    print('\n\n')
+    """
+    Prints feature-wise means and stds for any-shaped datasets.
+    Works for arrays of shape:
+        (N, F), (N, T, F), or (B, S, T, F)
+    """
+    print("Number of features:", train_set.shape[-1])
 
+    def summarize(name, arr):
+        # Average over all axes except the last (features)
+        axes = tuple(range(arr.ndim - 1))
+        mean = np.mean(arr, axis=axes)
+        std = np.std(arr, axis=axes)
+        print(f"{name} means: {[f'{x:.3f}' for x in mean]}")
+        print(f"{name} stds:  {[f'{x:.3f}' for x in std]}")
+
+    summarize("Train", train_set)
+    summarize("Val", val_set)
+    summarize("Test", test_set)
+    print("\n")
 
 
 #### Last step, Batching ####
@@ -341,8 +397,10 @@ def summarize_batched_data(X_train_batches, Y_train_batches,
 
 
 
-if __name__ == '__main__':
 
+
+
+if __name__ == '__main__':
     # ============================================================
     # 1) Load data from CSV
     # ============================================================
@@ -410,14 +468,24 @@ if __name__ == '__main__':
 
         print(X_train.shape, X_val.shape, X_test.shape)
 
-        """
-        if no shuffling, we do:
-        - SPLIT --> NORM --> SEQUENCE --> BATCH
-        """
+        
+    # No shuffling
     else:
         # ============================================================
         # 4) Split, Normalize, and Sequence
         # ============================================================
+        """
+        if no shuffling, we do:
+        - SPLIT --> NORM --> SEQUENCE --> BATCH
+        """
+
+        """
+        If DENOISING = True,
+        - SPLIT --> SEQUENCE --> DENOISE --> LOG RETURNS --> NORM --> BATCH
+        - We must perform the wavelet on each sequence
+        - We must perform the wavelet prior to normalization. 
+        - Therefore, we must normalize after sequencing
+        """
         
         train, val, test = split(arr, train_frac, val_frac)
 
@@ -427,7 +495,7 @@ if __name__ == '__main__':
             val = np.concatenate((val, val2), axis=0)
             test = np.concatenate((test, test2), axis=0)
 
-        if not DENOISE:
+        if not DENOISE: #If we have denoising, we do not want to normalize beforehand
             train, val, test = normalize_wrt_train(train, val, test)
             verify_normalization(train, val, test) #prints out summary
             
@@ -438,9 +506,13 @@ if __name__ == '__main__':
 
         if DENOISE:
             X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
-            Y_train, Y_val, Y_test = normalize_wrt_train(Y_train, Y_val, Y_test)
-            verify_normalization(train, val, test) #prints out summary
+            #Y_train, Y_val, Y_test = normalize_wrt_train(Y_train, Y_val, Y_test)
+            verify_normalization(X_train, X_val, X_test) #prints out summary
 
+        print(Y_train.shape)
+        
+        idx = np.random.choice(Y_train.shape[0], size=20, replace=False)
+        print(Y_train[idx])
 
     
 
@@ -449,11 +521,10 @@ if __name__ == '__main__':
     # 7) Create Batches of size `batch_size`
     # ============================================================
     print("starting batching...")
-
-    #Ignore last batches
-    X_train_batches, Y_train_batches, _, _ = create_batches(X_train, Y_train, batch_size)
+    X_train_batches, Y_train_batches, _, _ = create_batches(X_train, Y_train, batch_size)     #Ignore last batches
     X_val_batches, Y_val_batches, _, _ = create_batches(X_val, Y_val, batch_size)
     X_test_batches, Y_test_batches, _, _ = create_batches(X_test, Y_test, batch_size)
+    print("batching complete")
 
     summarize_batched_data(X_train_batches, Y_train_batches,
                             X_val_batches,   Y_val_batches,
@@ -473,6 +544,8 @@ if __name__ == '__main__':
         X_val_batches=X_val_batches, Y_val_batches=Y_val_batches,
         X_test_batches=X_test_batches, Y_test_batches=Y_test_batches,
     )   
+
+    print(f"Saved {fname}")
 
 
 
