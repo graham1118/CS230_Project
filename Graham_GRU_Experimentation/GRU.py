@@ -20,8 +20,8 @@ import time
 results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
 
-COMBINE_DATA = False
-BLOCK_SHUFFLE = False
+COMBINE_DATA = True
+BLOCK_SHUFFLE = True
 
 NPZ_FNAME = fname = f"preprocessed_data{'_COMBINED' if COMBINE_DATA else ''}{'_SHUFFLED' if BLOCK_SHUFFLE else ''}.npz"
 
@@ -43,12 +43,13 @@ Try:
 """
 
 INIT_LEARNING_RATE = 2e-4          # smaller LR helps stability
-NUM_EPOCHS = 150
+NUM_EPOCHS = 60
 NUM_GRU_LAYERS = 1
 GRU_HIDDEN_SIZE = 64
+LATENT_SIZE = 3
 CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
 MAX_LR = 2e-3
-MODEL_TO_USE = 'GRU' #or 'LSTM'
+MODEL_TO_USE = 'EncoderGRU' #or 'LSTM' or 'EncoderGRU'
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.2 #note used
 USE_SCHEDULER = True    # ReduceLROnPlateau on val loss
@@ -256,14 +257,72 @@ class GRU(nn.Module):
             batch_first=True,
             dropout=DROPOUT if num_layers > 1 else 0.0
         )
-        self.batchnorm = nn.BatchNorm1d(hidden_size)  # normalize hidden features
+        self.norm = nn.LayerNorm(hidden_size)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         out, _ = self.gru(x)                    # [B, T, H]
         out = out[:, -1, :]                     # last timestep [B, H]
-        out = self.batchnorm(out)               # normalize across batch
+        out = self.norm(out)
         out = self.fc(out)
+        return out
+
+class EncoderGRU(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,
+                 num_layers=1, latent_size=64):
+        """
+        Drop-in replacement for your GRU model, but with an
+        encoder in front that learns per-timestep features.
+
+        Args:
+            input_size:  feature dimension of each timestep
+            hidden_size: GRU hidden size
+            output_size: final output dimension
+            num_layers:  number of GRU layers
+            latent_size: encoder output dimension per timestep
+        """
+        super(EncoderGRU, self).__init__()
+
+        # ---- Encoder (per-timestep feedforward feature extractor) ----
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, latent_size),
+            nn.ReLU()
+        )
+
+        # ---- GRU (same structure as your baseline) ----
+        self.gru = nn.GRU(
+            input_size=latent_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.2 if num_layers > 1 else 0.0
+        )
+
+        # ---- Normalization and output projection ----
+        self.norm = nn.LayerNorm(hidden_size)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        """
+        x: [B, T, input_size]
+        returns: [B, output_size]
+        """
+        B, T, F = x.shape
+
+        # Encode each timestep independently
+        x_enc = self.encoder(x.view(B*T, F))      # [B*T, latent_size]
+        x_enc = x_enc.view(B, T, -1)              # [B, T, latent_size]
+
+        # Temporal modeling with GRU
+        out, _ = self.gru(x_enc)                  # [B, T, H]
+        out = out[:, -1, :]                       # last timestep [B, H]
+
+        # Normalize and project
+        out = self.norm(out)
+        out = self.fc(out)
+
         return out
 
 class LSTM(nn.Module):
@@ -512,6 +571,8 @@ if __name__ == "__main__":
 
     if MODEL_TO_USE == 'GRU':
         model = GRU(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=GRU_OUTPUT_SIZE, num_layers=NUM_GRU_LAYERS)
+    if MODEL_TO_USE == "EncoderGRU":
+        model = EncoderGRU(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=GRU_OUTPUT_SIZE, num_layers=NUM_GRU_LAYERS, latent_size=LATENT_SIZE)
     elif MODEL_TO_USE == 'LSTM':
         model = LSTM(input_size=X_train_batches.shape[-1], hidden_size=GRU_HIDDEN_SIZE, output_size=GRU_OUTPUT_SIZE, num_layers=NUM_GRU_LAYERS)
     else: 

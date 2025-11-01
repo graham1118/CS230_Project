@@ -6,26 +6,27 @@ import pandas_ta as ta
 import sys
 import matplotlib.pyplot as plt
 import pywt
+from scipy.signal import lfilter, butter
 
 ### Parameters ###
 SEED = 42
 rng = np.random.default_rng(seed=SEED)
 
 #### Can be any combination of True/False ####
-COMBINE_DATA = False
-BLOCK_SHUFFLE = False 
+COMBINE_DATA = True
+BLOCK_SHUFFLE = True 
 DENOISE = True
 #############################################
 
-BLOCK_SIZE = 4096
+BLOCK_SIZE = 2048
 HORIZON = 2
 EPS = 1e-8
 TA_LENGTH = 14 #technical indicator window for TA library functions
 SELECT_RANGE = False #used if you want to select a later range of the data, rather than all of it
 USE_MACD = True
-SEQ_LEN = 64
+SEQ_LEN = 16
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
-batch_size = 128  # must be power of 2 for efficient training
+batch_size = 256  # must be power of 2 for efficient training
 
 
 
@@ -47,9 +48,10 @@ def swt_denoise_multifeature(x, wavelet='db4', level=3, thresh_scale=0.7):
     lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x_pad)))
     coeffs_t = [(cA, pywt.threshold(cD, lam, mode='soft')) for (cA, cD) in coeffs]
     x_rec = pywt.iswt(coeffs_t, wavelet)
+    x_rec = x_rec.astype(np.float32)
     return x_rec[:len(x)]  
 
-def dwt_denoise_multifeature(
+def dwt_denoise_multifeature_orig(
     X,                      # shape (num_sequences, seq_len, num_features)
     wavelet='db4',
     level=3,
@@ -115,8 +117,194 @@ def dwt_denoise_multifeature(
 
             # --- Clip negatives before log ---
             out[s, :, f] = np.clip(x_rec, eps, None)
+            out = out.astype(np.float32)
 
     return out
+
+def dwt_denoise_multifeature_fast(
+    X, wavelet='db4', level=3, thresh_scale=0.7,
+    soft_or_hard='soft', mode='smooth', eps=1e-8
+):
+    num_seq, seq_len, num_feat = X.shape
+    out = np.empty_like(X, dtype=np.float32)
+
+    for f in range(num_feat):
+        for s in range(num_seq):
+            x = X[s, :, f]
+            coeffs = pywt.wavedec(x, wavelet=wavelet, level=level, mode=mode)
+            d1 = coeffs[-1]
+            sigma = np.median(np.abs(d1)) / 0.6745 + eps
+            lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x)))
+            coeffs_thr = [coeffs[0]] + [
+                pywt.threshold(c, lam, mode=soft_or_hard) for c in coeffs[1:]
+            ]
+            x_rec = pywt.waverec(coeffs_thr, wavelet=wavelet, mode=mode)
+            if len(x_rec) != len(x):
+                x_rec = x_rec[:len(x)] if len(x_rec) > len(x) else np.pad(x_rec, (0, len(x) - len(x_rec)), 'edge')
+            out[s, :, f] = np.clip(x_rec, eps, None).astype(np.float32)
+
+    return out
+
+def dwt_denoise_multifeature(
+    X, wavelet='db4', level=3, thresh_scale=0.7,
+    soft_or_hard='soft', mode='smooth', eps=1e-8
+):
+    num_seq, seq_len, num_feat = X.shape
+    # Preallocate with the final dtype so we never cast partial garbage.
+    out = np.empty_like(X, dtype=np.float32)
+
+    for f in range(num_feat):
+        for s in range(num_seq):
+            x = X[s, :, f].astype(float)
+
+            coeffs = pywt.wavedec(x, wavelet=wavelet, level=level, mode=mode)
+
+            d1 = coeffs[-1]
+            sigma = np.median(np.abs(d1)) / 0.6745 + eps
+            lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x)))
+
+            coeffs_thr = [coeffs[0]] + [
+                pywt.threshold(c, lam, mode=soft_or_hard) for c in coeffs[1:]
+            ]
+
+            x_rec = pywt.waverec(coeffs_thr, wavelet=wavelet, mode=mode)
+
+            if len(x_rec) > len(x):
+                x_rec = x_rec[:len(x)]
+            elif len(x_rec) < len(x):
+                x_rec = np.pad(x_rec, (0, len(x) - len(x_rec)), mode='edge')
+
+            # Clip to keep strictly positive for downstream logs
+            x_rec = np.clip(x_rec, eps, None)
+
+            # Write directly as float32 (no per-iteration casting of the whole array)
+            out[s, :, f] = x_rec.astype(np.float32)
+
+    return out
+
+def butter_denoise_multifeature(
+    X,                      # shape (num_sequences, seq_len, num_features)
+    N=3,                    # Filter order
+    Wn=0.2,                 # Normalized cutoff frequency (0 < Wn < 1)
+    eps=1e-8
+):
+    """
+    Perform multifeature denoising using a causal Butterworth low-pass filter.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        (num_sequences, seq_len, num_features)
+    N : int
+        Filter order
+    Wn : float
+        Normalized cutoff frequency (0 < Wn < 1, relative to Nyquist)
+    eps : float
+        Small constant to prevent log(0) downstream
+
+    Returns
+    -------
+    denoised : np.ndarray
+        Same shape as X, filtered along the time axis.
+    """
+
+    num_seq, seq_len, num_feat = X.shape
+    out = np.empty_like(X, dtype=np.float32)
+
+    # Design the Butterworth filter once
+    b, a = butter(N=N, Wn=Wn)
+
+    for f in range(num_feat):
+        for s in range(num_seq):
+            x = X[s, :, f].astype(np.float32)
+
+            # --- Apply causal low-pass filter ---
+            x_filt = lfilter(b, a, x)
+
+            # --- Clip tiny negatives before log transforms ---
+            out[s, :, f] = np.clip(x_filt, eps, None)
+
+    return out
+
+def kalman_denoise_multifeature(
+    X,
+    process_var=1e-5,     # process noise variance (Q)
+    obs_var=1e-3          # observation noise variance (R)
+):
+    """
+    Apply a simple 1D Kalman filter to each feature column independently.
+    State model: x_t = x_{t-1} + w_t
+    Observation: z_t = x_t + v_t
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Shape (n_timesteps, n_features)
+    process_var : float
+        Process noise variance (how much the hidden state can drift)
+    obs_var : float
+        Observation noise variance (how noisy measurements are)
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed data of same shape.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    n, m = X.shape
+    out = np.zeros_like(X)
+
+    for j in range(m):
+        z = X[:, j]
+        x_est = np.zeros(n, dtype=np.float32)
+        P = 1.0  # initial estimate uncertainty
+        x_est[0] = z[0]
+
+        for t in range(1, n):
+            # Prediction
+            x_pred = x_est[t-1]
+            P_pred = P + process_var
+
+            # Kalman Gain
+            K = P_pred / (P_pred + obs_var)
+
+            # Update
+            x_est[t] = x_pred + K * (z[t] - x_pred)
+            P = (1 - K) * P_pred
+
+        out[:, j] = x_est
+
+    return out
+
+def ema_denoise_multifeature(X, alpha=0.3):
+    """
+    Apply causal Exponential Moving Average (EMA) smoothing column-wise.
+    
+    Parameters
+    ----------
+    X : np.ndarray
+        Shape (n_timesteps, n_features)
+    alpha : float
+        Smoothing factor (0 < alpha <= 1). Smaller = smoother.
+    
+    Returns
+    -------
+    np.ndarray
+        Smoothed data of same shape.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    n, m = X.shape
+    out = np.zeros_like(X)
+
+    for j in range(m):
+        y = np.zeros(n, dtype=np.float32)
+        y[0] = X[0, j]
+        for t in range(1, n):
+            y[t] = alpha * X[t, j] + (1 - alpha) * y[t-1]
+        out[:, j] = y
+
+    return out
+
 """
  - DO NOT denoise volume or num trades - spikes are signal!!
  - DO NOT denoise technical indicators - they are already pretty smooth
@@ -147,10 +335,10 @@ def load_data(fname):
             .sort_values('close_time')
             .reset_index(drop=True)
         )
-
+    
     print(f"Loaded {len(df)} rows from CSV")
     print(f"Date range: {df['close_time'].min().strftime('%m/%d/%Y')} to {df['close_time'].max().strftime('%m/%d/%Y')}")  #print data range in MM/DD/YYYY format
-
+    
     return df
 
 def process_columns(df):
@@ -166,12 +354,33 @@ def process_columns(df):
 
     #Standard Moving Average
     df["SMA_14"] = ta.sma(df["close"], length=14)  
+    df = df.dropna(axis=0, how='any').reset_index(drop=True)
 
     # Taking returns centers the timeseries around 1. Taking log returns centers around 0 and improves stability of training.
-    if not DENOISE:
-        log_returns = np.log(df.iloc[:, :4] / df.iloc[:, :4].shift(1)) # First 4 columns only (e.g., open, high, low, close)
-        log_returns = log_returns.fillna(0)
-        df.iloc[:,:4] = log_returns
+    if DENOISE:
+        OHLC = df.iloc[:, :4].to_numpy()
+        denoised_OHLC = kalman_denoise_multifeature(OHLC)
+
+        n_original = len(df)
+        n_denoised = len(denoised_OHLC)
+        if n_denoised < n_original:
+            trim = n_original - n_denoised
+            df = df.iloc[trim:].reset_index(drop=True)
+            denoised_OHLC = denoised_OHLC[-len(df):]  # trim equally from denoised array
+
+        # ✅ Replace the first 4 columns with the denoised values
+        df.iloc[:, :4] = denoised_OHLC
+
+        
+
+    # # Check for negative values in the first 4 columns
+    neg_mask = (df.iloc[:, :4] < 0)
+    print(f"Number of negative values: {neg_mask.sum().sum()}")   # Should print 0 if no negatives exist
+
+    EPS = 1e-8
+    log_returns = np.log(np.clip(df.iloc[:, :4], EPS, None) / np.clip(df.iloc[:, :4].shift(1), EPS, None)) # First 4 columns only (e.g., open, high, low, close)
+    log_returns = log_returns.fillna(0)
+    df.iloc[:,:4] = log_returns
     df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_return_close'] + list(df.columns[4:])
 
 
@@ -230,33 +439,29 @@ def block_and_sequence(arr, BLOCK_SIZE, close_idx):
         blocked_Xs[i] = block_X
         blocked_Ys[i] = block_Y
 
+    # last_block_idx = -1
+    # X_last_block = blocked_Xs[last_block_idx]
+    # Y_last_block = blocked_Ys[last_block_idx]
+
+    # # Save this block for reconstruction (temporally latest, still ordered)
+    # np.savez_compressed("last_temporal_block.npz",
+    #     X_block=X_last_block,
+    #     Y_block=Y_last_block
+    # )
+    # print(f"Saved temporally last block for reconstruction with shape: {X_last_block.shape}")
+
     return blocked_Xs, blocked_Ys
 
 
 
 #### Critical Steps: Sequence, Split, Normalize ####
 def sequence(data, window, HORIZON, close_idx):
-    
     T = data.shape[0]
     starts = np.arange(0, T - window - HORIZON)
-    X = np.stack([data[i:i+window] for i in starts], axis=0) #shape (num_sequences, sequence_length, num_features)
-    
-    #######################
-    if DENOISE:
-        X_denoised = dwt_denoise_multifeature(X[:,:,:4])                                    # DENOISE
-        X_denoised = np.log((X_denoised[:, 1:, :4] + EPS) / (X_denoised[:, :-1, :4] + EPS)) # COMPUTE LOG RETURNS
-        X = np.concatenate((X_denoised, X[:,1:,4:]), axis=2)                                 # Add back with other features
-    #######################
-   
-    #Y = np.stack([data[i+window + HORIZON, close_idx:close_idx+1] for i in starts], axis=0) #for log returns
 
-    #Use log returns for Y as well
-    future_closes = data[window + HORIZON : window + HORIZON + len(starts), close_idx]
-    past_closes   = data[window + HORIZON - 1 : window + HORIZON - 1 + len(starts), close_idx]
-
-    Y = np.log((future_closes + EPS) / (past_closes + EPS))
-    Y = Y[:, np.newaxis]
-    Y = Y*1000
+    # --- Build feature sequences (X) ---
+    X = np.stack([data[i:i+window] for i in starts], axis=0)
+    Y = data[window + HORIZON : window + HORIZON + len(starts), close_idx][:, np.newaxis] #future close price
 
     return X, Y
 
@@ -495,19 +700,16 @@ if __name__ == '__main__':
             val = np.concatenate((val, val2), axis=0)
             test = np.concatenate((test, test2), axis=0)
 
-        if not DENOISE: #If we have denoising, we do not want to normalize beforehand
-            train, val, test = normalize_wrt_train(train, val, test)
-            verify_normalization(train, val, test) #prints out summary
+      
             
         print("Starting Sequencing...")
         X_train, Y_train = sequence(train, SEQ_LEN, HORIZON, close_idx)
         X_val, Y_val =     sequence(val, SEQ_LEN, HORIZON, close_idx)
         X_test, Y_test =   sequence(test, SEQ_LEN, HORIZON, close_idx)
 
-        if DENOISE:
-            X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
-            #Y_train, Y_val, Y_test = normalize_wrt_train(Y_train, Y_val, Y_test)
-            verify_normalization(X_train, X_val, X_test) #prints out summary
+       
+        X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
+        verify_normalization(X_train, X_val, X_test) #prints out summary
 
         print(Y_train.shape)
         
