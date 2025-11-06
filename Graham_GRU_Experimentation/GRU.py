@@ -20,8 +20,8 @@ import time
 results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
 
-COMBINE_DATA = True
-BLOCK_SHUFFLE = True
+COMBINE_DATA = False
+BLOCK_SHUFFLE = False
 
 NPZ_FNAME = fname = f"preprocessed_data{'_COMBINED' if COMBINE_DATA else ''}{'_SHUFFLED' if BLOCK_SHUFFLE else ''}.npz"
 
@@ -46,10 +46,10 @@ INIT_LEARNING_RATE = 2e-4          # smaller LR helps stability
 NUM_EPOCHS = 60
 NUM_GRU_LAYERS = 1
 GRU_HIDDEN_SIZE = 64
-LATENT_SIZE = 3
+LATENT_SIZE = 32
 CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
 MAX_LR = 2e-3
-MODEL_TO_USE = 'EncoderGRU' #or 'LSTM' or 'EncoderGRU'
+MODEL_TO_USE = 'EncoderGRU' # 'GRU' or 'LSTM' or 'EncoderGRU'
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.2 #note used
 USE_SCHEDULER = True    # ReduceLROnPlateau on val loss

@@ -13,8 +13,8 @@ SEED = 42
 rng = np.random.default_rng(seed=SEED)
 
 #### Can be any combination of True/False ####
-COMBINE_DATA = True
-BLOCK_SHUFFLE = True 
+COMBINE_DATA = False
+BLOCK_SHUFFLE = False 
 DENOISE = True
 #############################################
 
@@ -308,20 +308,7 @@ def ema_denoise_multifeature(X, alpha=0.3):
 """
  - DO NOT denoise volume or num trades - spikes are signal!!
  - DO NOT denoise technical indicators - they are already pretty smooth
- - DO NOT DENOISE Y labels
- - Denoise OHLC. Maybe try only denoising Close (not Open, High, Low, later on)
- - denoise within each sequence. If you denoise the whole timeseries, one sequence has info about the next. 
-   During online inference, I'll only be able to denoise each sequence, not "future points" that give me a hint of what's to come.
-   Therefore, I should train like I test, practice like I play.
- - Use stationary wavelet transform, keeps the same number of points
- - for 'mode' (mode is used for padding), use periodization, it just wraps the signal around. 
-
-
- !!! if DENOISE == True, don't take log returns until after sequencing. You'll lose 1 datapoint, but that's I accounted for this
- !!! keep threshold_scale=0.7. This multiplies the Universtal Noise threshold, which is a bit too aggressive
-
 """
-
 
 #### Initial Data Processing ####
 def load_data(fname):
@@ -462,6 +449,7 @@ def sequence(data, window, HORIZON, close_idx):
     # --- Build feature sequences (X) ---
     X = np.stack([data[i:i+window] for i in starts], axis=0)
     Y = data[window + HORIZON : window + HORIZON + len(starts), close_idx][:, np.newaxis] #future close price
+    Y = 1000*Y
 
     return X, Y
 
