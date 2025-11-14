@@ -29,6 +29,21 @@ train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
 batch_size = 256  # must be power of 2 for efficient training
 
 
+Y_SCALE = 1000.0  # fixed scale for targets and residuals
+
+def fit_mu_sigma_from_train(X_train):
+    # X_train: (N, T, F) in RAW units (not normalized)
+    mu = X_train.mean(axis=(0,1))          # (F,)
+    sigma = X_train.std(axis=(0,1)) + 1e-8 # (F,)
+    return mu, sigma
+
+def normalize_with_given_stats(arr, mu, sigma):
+    # arr: (..., F)
+    reshape = (1,)*(arr.ndim-1) + (-1,)
+    return (arr - mu.reshape(reshape)) / sigma.reshape(reshape)
+
+
+
 
 #### WAVELET DENOISING ####
 def swt_denoise_multifeature(x, wavelet='db4', level=3, thresh_scale=0.7):
@@ -446,12 +461,16 @@ def sequence(data, window, HORIZON, close_idx):
     T = data.shape[0]
     starts = np.arange(0, T - window - HORIZON)
 
-    # --- Build feature sequences (X) ---
+    # Build sequences in RAW feature space
     X = np.stack([data[i:i+window] for i in starts], axis=0)
-    Y = data[window + HORIZON : window + HORIZON + len(starts), close_idx][:, np.newaxis] #future close price
-    Y = 1000*Y
 
+    # Future target is RAW close log-return
+    y_raw = data[window + HORIZON : window + HORIZON + len(starts), close_idx][:, None]
+
+    # Scale Y by fixed factor only (no z-score)
+    Y = Y_SCALE * y_raw
     return X, Y
+
 
 def split(array, train_frac, val_frac):
     train_size = int(len(array) * train_frac)
@@ -696,8 +715,16 @@ if __name__ == '__main__':
         X_test, Y_test =   sequence(test, SEQ_LEN, HORIZON, close_idx)
 
        
-        X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
-        verify_normalization(X_train, X_val, X_test) #prints out summary
+        # X_* are RAW here. Fit mu/sigma on TRAIN only and save them.
+        mu_vec, sigma_vec = fit_mu_sigma_from_train(X_train.copy())
+        pd.DataFrame({"mu": mu_vec, "sigma": sigma_vec}).to_csv("mu_sigma_df.csv", index=False)
+
+        # Normalize X with those fixed stats
+        X_train = normalize_with_given_stats(X_train, mu_vec, sigma_vec)
+        X_val   = normalize_with_given_stats(X_val,   mu_vec, sigma_vec)
+        X_test  = normalize_with_given_stats(X_test,  mu_vec, sigma_vec)
+
+        verify_normalization(X_train, X_val, X_test)
 
         print(Y_train.shape)
         
@@ -729,11 +756,20 @@ if __name__ == '__main__':
     # ============================================================
     fname = f"preprocessed_data{'_COMBINED' if COMBINE_DATA else ''}{'_SHUFFLED' if BLOCK_SHUFFLE else ''}.npz"
 
-    np.savez_compressed(fname,
+    meta = {
+        "close_idx": int(close_idx),
+        "y_scaled_by": float(Y_SCALE),
+        "y_is_zscored": False
+    }
+
+    np.savez_compressed(
+        fname,
         X_train_batches=X_train_batches, Y_train_batches=Y_train_batches,
-        X_val_batches=X_val_batches, Y_val_batches=Y_val_batches,
-        X_test_batches=X_test_batches, Y_test_batches=Y_test_batches,
-    )   
+        X_val_batches=X_val_batches,     Y_val_batches=Y_val_batches,
+        X_test_batches=X_test_batches,   Y_test_batches=Y_test_batches,
+        meta=np.array([meta], dtype=object)
+    )
+
 
     print(f"Saved {fname}")
 

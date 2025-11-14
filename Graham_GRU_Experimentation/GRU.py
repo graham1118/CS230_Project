@@ -44,8 +44,8 @@ Try:
 
 INIT_LEARNING_RATE = 2e-4          # smaller LR helps stability
 NUM_EPOCHS = 60
-NUM_GRU_LAYERS = 1
-GRU_HIDDEN_SIZE = 64
+NUM_GRU_LAYERS = 2
+GRU_HIDDEN_SIZE = 512
 LATENT_SIZE = 32
 CLIP_GRAD_NORM = 1.0    # gradient clipping to prevent explosion
 MAX_LR = 2e-3
@@ -86,21 +86,25 @@ def compute_extras(model, X, Y):
     preds = []
     trues = []
     for xb, yb in zip(X, Y):
-        pr_resid = model(xb)
-        pr = pr_resid + xb[:, -1, close_idx].unsqueeze(-1)
-        # de-normalize close log-returns
-        pr = (pr[:, 0] * sigma[close_idx] + mu[close_idx]).detach().cpu()
-        yb = (yb[:, 0] * sigma[close_idx] + mu[close_idx]).detach().cpu()
-        preds.append(pr); trues.append(yb)
+        pr_resid = model(xb)  # residual in scaled raw units
+        last_close_raw = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
+        last_scaled = Y_SCALE * last_close_raw.unsqueeze(-1)
+
+        pr_full = pr_resid + last_scaled  # scaled raw
+        pr_raw = pr_full[:, 0] / Y_SCALE  # back to raw returns
+        yb_raw = yb[:, 0]       / Y_SCALE
+
+        preds.append(pr_raw.cpu())
+        trues.append(yb_raw.cpu())
+
     p = torch.cat(preds); t = torch.cat(trues)
     p_mean, t_mean = p.mean(), t.mean()
     p_std,  t_std  = p.std(unbiased=False), t.std(unbiased=False)
     cov = ((p - p_mean) * (t - t_mean)).mean()
     corr = float(cov / (p_std * t_std + 1e-12))
     mse = float(((p - t) ** 2).mean())
-    t_var = float(t.var(unbiased=False))  # population variance of true raw returns
+    t_var = float(t.var(unbiased=False))
     r2 = float(1.0 - (mse / (t_var + 1e-12)))
-
     return {
         "pearson_r": corr,
         "pred_std": float(p_std),
@@ -114,17 +118,14 @@ def compute_extras(model, X, Y):
 
 @torch.no_grad()
 def baseline_metrics_persistence(X, Y):
-    # predict that next return equals last observed close return in the sequence
     correct = total = 0
     abs_sum = sq_sum = 0.0
     for xb, yb in zip(X, Y):
-        last_close = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
-        true_raw   = yb[:, 0] * sigma[close_idx] + mu[close_idx]
-        pred_raw   = last_close
-        # MSE/MAE on raw
+        last_close_raw = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
+        true_raw   = yb[:, 0] / Y_SCALE
+        pred_raw   = last_close_raw
         abs_sum += float((pred_raw - true_raw).abs().sum().item())
         sq_sum  += float(((pred_raw - true_raw)**2).sum().item())
-        # sign acc
         mask = (true_raw != 0)
         correct += int((torch.sign(pred_raw[mask]) == torch.sign(true_raw[mask])).sum().item())
         total   += int(mask.sum().item())
@@ -133,11 +134,10 @@ def baseline_metrics_persistence(X, Y):
 
 @torch.no_grad()
 def baseline_metrics_zero(Y):
-    # predict zero return
     abs_sum = sq_sum = 0.0
     correct = total = 0
     for yb in Y:
-        true_raw = yb[:, 0] * sigma[close_idx] + mu[close_idx]
+        true_raw = yb[:, 0] / Y_SCALE
         pred_raw = torch.zeros_like(true_raw)
         abs_sum += float((pred_raw - true_raw).abs().sum().item())
         sq_sum  += float(((pred_raw - true_raw)**2).sum().item())
@@ -154,20 +154,28 @@ def baseline_metrics_zero(Y):
 # Load & reshape preprocessed batches from NPZ
 # ============================================
 def load_preprocessed_data(path=NPZ_PATH):
-    """
-    Returns:
-        dict: Dictionary containing all arrays stored in the file.
-              Keys: 'X_train_batches', 'Y_train_batches', etc.
-    """
-
-    with np.load(path) as data:
+    with np.load(path, allow_pickle=True) as data:
         dataset = {key: data[key] for key in data.files}
     return dataset
+
+
+
+
+
 def flatten_features_to_close(Y):
     return  Y [..., 0].unsqueeze(-1)
 
 
 data = load_preprocessed_data()
+
+# ---- read meta from NPZ ----
+if "meta" in data:
+    _meta = data["meta"][()].item()
+    Y_SCALE = float(_meta.get("y_scaled_by", 1000.0))
+    assert _meta.get("y_is_zscored", False) is False, "This training expects Y not z-scored"
+else:
+    Y_SCALE = 1000.0  # fallback
+
 with open(COL_NAMES_PATH, "r", encoding="utf-8", errors="ignore") as f:
     txt = f.read()
 feature_names = [x.strip().strip("[]'\"") for x in txt.replace("\n", ",").split(",") if x.strip()]
@@ -355,39 +363,31 @@ class LSTM(nn.Module):
     # set-level operations you need to write loops over batches and accumulate results.
 
 @torch.no_grad()
-def compute_set_metrics(model, X, Y, device="cpu"):
+def compute_set_metrics(model, X, Y):
     model.eval()
-    if isinstance(X, np.ndarray): X = torch.tensor(X, dtype=torch.float32)
-    if isinstance(Y, np.ndarray): Y = torch.tensor(Y, dtype=torch.float32)
-    X, Y = X.to(device), Y.to(device)
-
-    abs_sum = 0.0
-    sq_sum  = 0.0
-    correct = 0
-    total   = 0
-    n_samples = 0
-
+    abs_sum = sq_sum = 0.0
+    correct = total = 0
+    n = 0
     for xb, yb in zip(X, Y):
         pr_resid = model(xb)
-        pr = pr_resid + xb[:, -1, close_idx].unsqueeze(-1)
+        last_close_raw = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
+        last_scaled = Y_SCALE * last_close_raw.unsqueeze(-1)
 
+        pr_full = pr_resid + last_scaled        # scaled raw
+        pr_raw  = pr_full[:, 0] / Y_SCALE       # raw
+        yb_raw  = yb[:, 0]      / Y_SCALE       # raw
 
-        abs_sum  += float((pr - yb).abs().sum().item())
-        sq_sum   += float(((pr - yb) ** 2).sum().item())
-        n_samples += pr.numel()
+        abs_sum += (pr_raw - yb_raw).abs().sum().item()
+        sq_sum  += ((pr_raw - yb_raw)**2).sum().item()
+        n       += pr_raw.numel()
 
-        # --- sign accuracy on *raw* (de-normalized) close log-returns ---
-        pr_raw = pr[:, 0] * sigma[close_idx] + mu[close_idx]
-        yb_raw = yb[:, 0] * sigma[close_idx] + mu[close_idx]
-        pred_sign = torch.sign(pr_raw)
-        true_sign = torch.sign(yb_raw)
-        mask = (true_sign != 0)
-        correct += int((pred_sign[mask] == true_sign[mask]).sum().item())
-        total   += int(mask.sum().item())
+        mask = (yb_raw != 0)
+        correct += (torch.sign(pr_raw[mask]) == torch.sign(yb_raw[mask])).sum().item()
+        total   += mask.sum().item()
 
-    mae   = abs_sum / max(1, n_samples)
-    rmse  = (sq_sum / max(1, n_samples)) ** 0.5
-    sacc  = (correct / total) if total > 0 else float("nan")
+    mae  = abs_sum / n
+    rmse = (sq_sum / n) ** 0.5
+    sacc = correct / max(1, total)
     return mae, rmse, sacc
 
 @torch.no_grad()
@@ -398,12 +398,15 @@ def compute_set_loss(model, X, Y, loss_func, device="cpu"):
     X, Y = X.to(device), Y.to(device)
     for xb, yb in zip(X, Y):
         pr_resid = model(xb)
-        last = xb[:, -1, close_idx].unsqueeze(-1)
-        pr_full = pr_resid + last
+        last_close_raw = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
+        last_scaled = Y_SCALE * last_close_raw.unsqueeze(-1)
+        pr_full = pr_resid + last_scaled   # in the same scaled raw space as yb
+
         loss = loss_func(pr_full, yb)
         total_loss += float(loss.item()) * xb.shape[0]
         num_samples += xb.shape[0]
     return total_loss / max(1, num_samples), total_loss
+
 
 @torch.no_grad()
 def compute_set_loss_close(model, X, Y, loss_func, device="cpu"):
@@ -497,15 +500,29 @@ def train_model(
                 # inside the training loop, replace the dbg block with:
                 with torch.no_grad():
                     last = xb[:, -1, close_idx].unsqueeze(-1)
-                    out_std = pred.std().item()
-                    tgt_std = (yb - last).std().item()
-                    out_mean = pred.mean().item()
-                    print(f"    [dbg] out_std={out_std:.4f} tgt_std={tgt_std:.4f} out_mean={out_mean:.4e}")
+                    target_resid = yb - last
+                    print(
+                    f"resid std: pred={pred.std():.4f} tgt={target_resid.std():.4f} | "
+                    f"raw std: pred={( (pred+last)[:,0]*sigma[close_idx]+mu[close_idx] ).std():.4e} "
+                    f"tgt={ ( yb[:,0]*sigma[close_idx]+mu[close_idx] ).std():.4e}"
+                    )
 
 
-            last = xb[:, -1, close_idx].unsqueeze(-1)     # z-scored last close
-            target_resid = yb - last
-            loss = criterion(pred, target_resid)          # model predicts residual directly
+            # last close in RAW units from normalized X
+            last_close_raw = xb[:, -1, close_idx] * sigma[close_idx] + mu[close_idx]
+            last_scaled = Y_SCALE * last_close_raw.unsqueeze(-1)  # scaled raw
+
+            # Residual target and loss in scaled raw units
+            target_resid = yb - last_scaled
+            pred = model(xb)
+            if bi == 1:
+                with torch.no_grad():
+                    print(
+                    f"resid std: pred={pred.std():.4f} tgt={target_resid.std():.4f} | "
+                    f"raw std: pred={( (pred+last_scaled)[:,0]/Y_SCALE ).std():.4e} "
+                    f"tgt={ ( yb[:,0]/Y_SCALE ).std():.4e}"
+                    )
+            loss = criterion(pred, target_resid)
 
             y_hat = pred
             loss.backward()
