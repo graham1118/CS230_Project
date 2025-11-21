@@ -16,7 +16,7 @@ rng = np.random.default_rng(seed=SEED)
 COMBINE_DATA = False
 BLOCK_SHUFFLE = False 
 DENOISE = True
-#############################################
+SMOOTH_FACTOR = 100    #observation noise is N times larger than process noise. for denoising
 
 BLOCK_SIZE = 2048
 HORIZON = 2
@@ -27,6 +27,7 @@ USE_MACD = True
 SEQ_LEN = 16
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
 batch_size = 256  # must be power of 2 for efficient training
+#############################################
 
 
 
@@ -50,76 +51,6 @@ def swt_denoise_multifeature(x, wavelet='db4', level=3, thresh_scale=0.7):
     x_rec = pywt.iswt(coeffs_t, wavelet)
     x_rec = x_rec.astype(np.float32)
     return x_rec[:len(x)]  
-
-def dwt_denoise_multifeature_orig(
-    X,                      # shape (num_sequences, seq_len, num_features)
-    wavelet='db4',
-    level=3,
-    thresh_scale=0.7,
-    soft_or_hard='soft',
-    mode='smooth',          # key difference from SWT
-    eps=1e-8
-):
-    """
-    Perform multifeature denoising using DWT (causal-safe) with mode='smooth'.
-    Preserves sequence length via reconstruction (pywt.waverec).
-
-    Parameters
-    ----------
-    X : np.ndarray
-        (num_sequences, seq_len, num_features)
-    wavelet : str
-        Wavelet basis (e.g. 'db4', 'bior1.3', etc.)
-    level : int
-        Decomposition level
-    thresh_scale : float
-        Multiplier for universal threshold
-    soft_or_hard : str
-        Thresholding mode ('soft' or 'hard')
-    mode : str
-        Edge mode passed to pywt.wavedec (default 'smooth')
-    eps : float
-        Small constant for numerical safety / clipping
-
-    Returns
-    -------
-    denoised : np.ndarray
-        Same shape as X, length preserved.
-    """
-    num_seq, seq_len, num_feat = X.shape
-    out = np.empty_like(X, dtype=float)
-
-    for f in range(num_feat):
-        for s in range(num_seq):
-            x = X[s, :, f].astype(float)
-
-            # --- Wavelet decomposition ---
-            coeffs = pywt.wavedec(x, wavelet=wavelet, level=level, mode=mode)
-
-            # --- Estimate noise sigma from the finest detail ---
-            d1 = coeffs[-1]
-            sigma = np.median(np.abs(d1)) / 0.6745 + eps
-            lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x)))
-
-            # --- Threshold all detail coefficients ---
-            coeffs_thr = [coeffs[0]] + [
-                pywt.threshold(c, lam, mode=soft_or_hard) for c in coeffs[1:]
-            ]
-
-            # --- Reconstruct ---
-            x_rec = pywt.waverec(coeffs_thr, wavelet=wavelet, mode=mode)
-
-            # --- Crop or pad to original length ---
-            if len(x_rec) > len(x):
-                x_rec = x_rec[:len(x)]
-            elif len(x_rec) < len(x):
-                x_rec = np.pad(x_rec, (0, len(x) - len(x_rec)), mode='edge')
-
-            # --- Clip negatives before log ---
-            out[s, :, f] = np.clip(x_rec, eps, None)
-            out = out.astype(np.float32)
-
-    return out
 
 def dwt_denoise_multifeature_fast(
     X, wavelet='db4', level=3, thresh_scale=0.7,
@@ -145,92 +76,14 @@ def dwt_denoise_multifeature_fast(
 
     return out
 
-def dwt_denoise_multifeature(
-    X, wavelet='db4', level=3, thresh_scale=0.7,
-    soft_or_hard='soft', mode='smooth', eps=1e-8
-):
-    num_seq, seq_len, num_feat = X.shape
-    # Preallocate with the final dtype so we never cast partial garbage.
-    out = np.empty_like(X, dtype=np.float32)
-
-    for f in range(num_feat):
-        for s in range(num_seq):
-            x = X[s, :, f].astype(float)
-
-            coeffs = pywt.wavedec(x, wavelet=wavelet, level=level, mode=mode)
-
-            d1 = coeffs[-1]
-            sigma = np.median(np.abs(d1)) / 0.6745 + eps
-            lam = thresh_scale * sigma * np.sqrt(2 * np.log(len(x)))
-
-            coeffs_thr = [coeffs[0]] + [
-                pywt.threshold(c, lam, mode=soft_or_hard) for c in coeffs[1:]
-            ]
-
-            x_rec = pywt.waverec(coeffs_thr, wavelet=wavelet, mode=mode)
-
-            if len(x_rec) > len(x):
-                x_rec = x_rec[:len(x)]
-            elif len(x_rec) < len(x):
-                x_rec = np.pad(x_rec, (0, len(x) - len(x_rec)), mode='edge')
-
-            # Clip to keep strictly positive for downstream logs
-            x_rec = np.clip(x_rec, eps, None)
-
-            # Write directly as float32 (no per-iteration casting of the whole array)
-            out[s, :, f] = x_rec.astype(np.float32)
-
-    return out
-
-def butter_denoise_multifeature(
-    X,                      # shape (num_sequences, seq_len, num_features)
-    N=3,                    # Filter order
-    Wn=0.2,                 # Normalized cutoff frequency (0 < Wn < 1)
-    eps=1e-8
-):
-    """
-    Perform multifeature denoising using a causal Butterworth low-pass filter.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        (num_sequences, seq_len, num_features)
-    N : int
-        Filter order
-    Wn : float
-        Normalized cutoff frequency (0 < Wn < 1, relative to Nyquist)
-    eps : float
-        Small constant to prevent log(0) downstream
-
-    Returns
-    -------
-    denoised : np.ndarray
-        Same shape as X, filtered along the time axis.
-    """
-
-    num_seq, seq_len, num_feat = X.shape
-    out = np.empty_like(X, dtype=np.float32)
-
-    # Design the Butterworth filter once
-    b, a = butter(N=N, Wn=Wn)
-
-    for f in range(num_feat):
-        for s in range(num_seq):
-            x = X[s, :, f].astype(np.float32)
-
-            # --- Apply causal low-pass filter ---
-            x_filt = lfilter(b, a, x)
-
-            # --- Clip tiny negatives before log transforms ---
-            out[s, :, f] = np.clip(x_filt, eps, None)
-
-    return out
-
 def kalman_denoise_multifeature(
     X,
-    process_var=1e-5,     # process noise variance (Q)
-    obs_var=1e-3          # observation noise variance (R)
+    process_var=1e-4,     # process noise variance (Q)
+    smoothing_amt=SMOOTH_FACTOR     # multiplies with obs_var (R)
+   
 ):
+    
+
     """
     Apply a simple 1D Kalman filter to each feature column independently.
     State model: x_t = x_{t-1} + w_t
@@ -250,6 +103,10 @@ def kalman_denoise_multifeature(
     np.ndarray
         Smoothed data of same shape.
     """
+
+    obs_var = process_var * smoothing_amt  # observation noise variance (R)
+
+
     X = np.asarray(X, dtype=np.float32)
     n, m = X.shape
     out = np.zeros_like(X)
@@ -276,34 +133,6 @@ def kalman_denoise_multifeature(
 
     return out
 
-def ema_denoise_multifeature(X, alpha=0.3):
-    """
-    Apply causal Exponential Moving Average (EMA) smoothing column-wise.
-    
-    Parameters
-    ----------
-    X : np.ndarray
-        Shape (n_timesteps, n_features)
-    alpha : float
-        Smoothing factor (0 < alpha <= 1). Smaller = smoother.
-    
-    Returns
-    -------
-    np.ndarray
-        Smoothed data of same shape.
-    """
-    X = np.asarray(X, dtype=np.float32)
-    n, m = X.shape
-    out = np.zeros_like(X)
-
-    for j in range(m):
-        y = np.zeros(n, dtype=np.float32)
-        y[0] = X[0, j]
-        for t in range(1, n):
-            y[t] = alpha * X[t, j] + (1 - alpha) * y[t-1]
-        out[:, j] = y
-
-    return out
 
 """
  - DO NOT denoise volume or num trades - spikes are signal!!
@@ -346,26 +175,50 @@ def process_columns(df):
     # Taking returns centers the timeseries around 1. Taking log returns centers around 0 and improves stability of training.
     if DENOISE:
         OHLC = df.iloc[:, :4].to_numpy()
-        denoised_OHLC = kalman_denoise_multifeature(OHLC)
+        original_close = df.iloc[:, 3].copy()  # Save original for comparison
+        denoised_OHLC = kalman_denoise_multifeature(OHLC, smoothing_amt=SMOOTH_FACTOR)
 
         n_original = len(df)
         n_denoised = len(denoised_OHLC)
         if n_denoised < n_original:
             trim = n_original - n_denoised
             df = df.iloc[trim:].reset_index(drop=True)
+            original_close = original_close.iloc[trim:].reset_index(drop=True)
             denoised_OHLC = denoised_OHLC[-len(df):]  # trim equally from denoised array
 
         # ✅ Replace the first 4 columns with the denoised values
         df.iloc[:, :4] = denoised_OHLC
 
-        
+        # Visualize denoising effect on close price (random 1000-point window)
+        if len(df) > 1000:
+            start_idx = np.random.randint(0, len(df) - 1000)
+            window_slice = slice(start_idx, start_idx + 1000)
+        else:
+            window_slice = slice(0, len(df))
+
+        plt.figure(figsize=(14, 6))
+        plt.plot(original_close.iloc[window_slice].values, label='Original Close Price', linewidth=1, alpha=0.6, color='gray')
+        plt.plot(df.iloc[window_slice, 3].values, label='Denoised Close Price (Kalman)', linewidth=1.5, alpha=0.9, color='blue')
+        plt.title(f'Denoising Effect on Close Price (Random {len(df.iloc[window_slice])} datapoints, BEFORE log returns)\nSmoothing Factor: {SMOOTH_FACTOR}', fontsize=14)
+        plt.xlabel('Sample Index', fontsize=12)
+        plt.ylabel('Price (USD)', fontsize=12)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.tight_layout()
+        plt.savefig('denoised_close_price_preview.png', dpi=150, bbox_inches='tight')
+        print(f"\n📊 Saved denoising comparison to: denoised_close_price_preview.png")
+        print(f"   Window: samples {window_slice.start} to {window_slice.stop}")
+        print(f"   Smoothing factor: {SMOOTH_FACTOR} (Q/R ratio: {2e-4 / (2e-4 * SMOOTH_FACTOR):.4f})\n")
+        plt.show()
 
     # # Check for negative values in the first 4 columns
     neg_mask = (df.iloc[:, :4] < 0)
     print(f"Number of negative values: {neg_mask.sum().sum()}")   # Should print 0 if no negatives exist
 
     EPS = 1e-8
-    log_returns = np.log(np.clip(df.iloc[:, :4], EPS, None) / np.clip(df.iloc[:, :4].shift(1), EPS, None)) # First 4 columns only (e.g., open, high, low, close)
+    # Compute log returns: all OHLC relative to previous close price
+    prev_close = df.iloc[:, 3].shift(1)  # Previous close (4th column, index 3)
+    log_returns = np.log(np.clip(df.iloc[:, :4], EPS, None).div(np.clip(prev_close, EPS, None), axis=0))
     log_returns = log_returns.fillna(0)
     df.iloc[:,:4] = log_returns
     df.columns = ['log_return_open', 'log_return_high', 'log_return_low', 'log_return_close'] + list(df.columns[4:])
@@ -375,15 +228,22 @@ def process_columns(df):
     ### REMOVE UN-NEEDED COLUMNS ###
     close_times = df['close_time']
     close_times.to_csv('datapoint_timestamps.csv', index=True, header=True)
+
+    # Keep timestamps as numpy array for sequencing
+    timestamps = close_times.to_numpy()
+
     df.drop(columns=['close_time', 'BBL_20_2.0_2.0', 'BBM_20_2.0_2.0', 'BBU_20_2.0_2.0', 'BBB_20_2.0_2.0', 'BBP_20_2.0_2.0', 'number_of_trades'], inplace=True)
 
-    if USE_MACD: df = df.iloc[33:,:] # ONLY use FOR MACD
+    if USE_MACD:
+        df = df.iloc[33:, :]  # ONLY use FOR MACD
+        timestamps = timestamps[33:]  # Keep timestamps aligned
+
     df.columns.to_series().to_csv("column_names.csv", index=False, header=False)
     arr = df.to_numpy()
     close_idx = df.columns.get_loc('log_return_close')
     print(f"Columns After Processing: {df.columns.tolist()}\n\n")
 
-    return df.columns.tolist(), arr, close_idx
+    return df.columns.tolist(), arr, close_idx, timestamps
 
 
 #### Functions for Shuffling ####
@@ -442,16 +302,35 @@ def block_and_sequence(arr, BLOCK_SIZE, close_idx):
 
 
 #### Critical Steps: Sequence, Split, Normalize ####
-def sequence(data, window, HORIZON, close_idx):
+def sequence(data, window, HORIZON, close_idx, timestamps=None):
+    """
+    Create sequences with optional timestamp tracking.
+
+    For each sequence:
+    - X spans timestamps[i : i+window]
+    - Y corresponds to timestamp[i+window+HORIZON-1] (the target prediction time)
+    """
     T = data.shape[0]
     starts = np.arange(0, T - window - HORIZON)
 
     # --- Build feature sequences (X) ---
     X = np.stack([data[i:i+window] for i in starts], axis=0)
-    Y = data[window + HORIZON : window + HORIZON + len(starts), close_idx][:, np.newaxis] #future close price
+    # Y is HORIZON steps ahead of the last element in X
+    # For sequence starting at i: X ends at i+window-1, Y is at i+window+HORIZON-1
+    # Using array slicing: Y[k] corresponds to X sequence starting at starts[k]
+    Y = data[window + HORIZON - 1 : window + HORIZON - 1 + len(starts), close_idx][:, np.newaxis]
     Y = 1000*Y
 
-    return X, Y
+    # --- Build timestamp arrays if provided ---
+    X_timestamps = None
+    Y_timestamps = None
+    if timestamps is not None:
+        # For each sequence, store the timestamps of the input window
+        X_timestamps = np.stack([timestamps[i:i+window] for i in starts], axis=0)
+        # For Y, store the timestamp of the target value (HORIZON steps after last X)
+        Y_timestamps = timestamps[window + HORIZON - 1 : window + HORIZON - 1 + len(starts)]
+
+    return X, Y, X_timestamps, Y_timestamps
 
 def split(array, train_frac, val_frac):
     train_size = int(len(array) * train_frac)
@@ -487,7 +366,7 @@ def normalize_wrt_train(train, val, test, eps=1e-8):
     val_norm   = (val   - mu) / sigma
     test_norm  = (test  - mu) / sigma
 
-    return train_norm, val_norm, test_norm
+    return train_norm, val_norm, test_norm, mu.squeeze(), sigma.squeeze()
 
 def verify_normalization(train_set, val_set, test_set):
     """
@@ -608,11 +487,11 @@ if __name__ == '__main__':
     # ============================================================
     # 2) Add New Technical Indicators and compute log returns
     # ============================================================
-    col_names, arr, close_idx = process_columns(df)
+    col_names, arr, close_idx, timestamps = process_columns(df)
     NUM_FEATURES = arr.shape[1]
 
     if COMBINE_DATA:
-        col_names2, arr2, _ = process_columns(df2)
+        col_names2, arr2, _, timestamps2 = process_columns(df2)
 
     # print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
     # sys.exit(0)
@@ -656,8 +535,9 @@ if __name__ == '__main__':
         X_test  = X_test.reshape(-1, X_test.shape[2], X_test.shape[3])
         Y_test  = Y_test.reshape(-1, Y_test.shape[2])
 
-        X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
-        Y_train, Y_val, Y_test = normalize_wrt_train(Y_train, Y_val, Y_test)
+        X_train, X_val, X_test, mu_x, sigma_x = normalize_wrt_train(X_train, X_val, X_test)
+        Y_train, Y_val, Y_test, mu_y, sigma_y = normalize_wrt_train(Y_train, Y_val, Y_test)
+
 
         print(X_train.shape, X_val.shape, X_test.shape)
 
@@ -681,23 +561,36 @@ if __name__ == '__main__':
         """
         
         train, val, test = split(arr, train_frac, val_frac)
+        timestamps_train, timestamps_val, timestamps_test = split(timestamps, train_frac, val_frac)
 
         if COMBINE_DATA:
             train2, val2, test2 = split(arr2, train_frac, val_frac)
+            timestamps_train2, timestamps_val2, timestamps_test2 = split(timestamps2, train_frac, val_frac)
             train = np.concatenate((train, train2), axis=0)
             val = np.concatenate((val, val2), axis=0)
             test = np.concatenate((test, test2), axis=0)
+            timestamps_train = np.concatenate((timestamps_train, timestamps_train2), axis=0)
+            timestamps_val = np.concatenate((timestamps_val, timestamps_val2), axis=0)
+            timestamps_test = np.concatenate((timestamps_test, timestamps_test2), axis=0)
 
-      
-            
+
+
         print("Starting Sequencing...")
-        X_train, Y_train = sequence(train, SEQ_LEN, HORIZON, close_idx)
-        X_val, Y_val =     sequence(val, SEQ_LEN, HORIZON, close_idx)
-        X_test, Y_test =   sequence(test, SEQ_LEN, HORIZON, close_idx)
+        X_train, Y_train, X_train_ts, Y_train_ts = sequence(train, SEQ_LEN, HORIZON, close_idx, timestamps_train)
+        X_val, Y_val, X_val_ts, Y_val_ts = sequence(val, SEQ_LEN, HORIZON, close_idx, timestamps_val)
+        X_test, Y_test, X_test_ts, Y_test_ts = sequence(test, SEQ_LEN, HORIZON, close_idx, timestamps_test)
 
        
-        X_train, X_val, X_test = normalize_wrt_train(X_train, X_val, X_test)
+        X_train, X_val, X_test, mu_x, sigma_x = normalize_wrt_train(X_train, X_val, X_test)
         verify_normalization(X_train, X_val, X_test) #prints out summary
+
+         # Save normalization statistics
+        mu_sigma_df = pd.DataFrame({
+            'mu': mu_x,
+            'sigma': sigma_x
+        })
+        mu_sigma_df.to_csv('mu_sigma_df.csv', index=False)
+        print("Saved normalization statistics to mu_sigma_df.csv")
 
         print(Y_train.shape)
         
@@ -714,6 +607,11 @@ if __name__ == '__main__':
     X_train_batches, Y_train_batches, _, _ = create_batches(X_train, Y_train, batch_size)     #Ignore last batches
     X_val_batches, Y_val_batches, _, _ = create_batches(X_val, Y_val, batch_size)
     X_test_batches, Y_test_batches, _, _ = create_batches(X_test, Y_test, batch_size)
+
+    # Batch timestamps (for human verification, not model input)
+    X_train_ts_batches, Y_train_ts_batches, _, _ = create_batches(X_train_ts, Y_train_ts, batch_size)
+    X_val_ts_batches, Y_val_ts_batches, _, _ = create_batches(X_val_ts, Y_val_ts, batch_size)
+    X_test_ts_batches, Y_test_ts_batches, _, _ = create_batches(X_test_ts, Y_test_ts, batch_size)
     print("batching complete")
 
     summarize_batched_data(X_train_batches, Y_train_batches,
@@ -733,6 +631,9 @@ if __name__ == '__main__':
         X_train_batches=X_train_batches, Y_train_batches=Y_train_batches,
         X_val_batches=X_val_batches, Y_val_batches=Y_val_batches,
         X_test_batches=X_test_batches, Y_test_batches=Y_test_batches,
+        X_train_ts_batches=X_train_ts_batches, Y_train_ts_batches=Y_train_ts_batches,
+        X_val_ts_batches=X_val_ts_batches, Y_val_ts_batches=Y_val_ts_batches,
+        X_test_ts_batches=X_test_ts_batches, Y_test_ts_batches=Y_test_ts_batches,
     )   
 
     print(f"Saved {fname}")
