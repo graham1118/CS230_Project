@@ -2,6 +2,37 @@
 
 This project implements and compares multiple deep learning architectures (Attention-based Seq2Seq, GRU, LSTM, MLP) for forecasting cryptocurrency prices (BTC/ETH). It provides a full pipeline from raw data acquisition and denoising, through feature engineering and normalization, to model training, evaluation, and profit/loss (PnL) backtesting.
 
+
+
+## For Graders: How to Run
+
+### Prerequisites
+Install the required Python packages, for example via `pip`:
+
+```bash
+pip install torch numpy pandas matplotlib binance-connector pandas_ta scipy fastdtw
+```
+
+
+### Step 0: There is no need to run 02_Data_Preprocessing.py, nor GRU.py. 
+The current trained model is saved in GRU_Experimentation/cur_best_model.pth. Using this saved model, evaluation scripts can be run without first having to train the model from scratch. You may look at GRU_Experimentation/loss_curve.png to see loss curve for the most recently trained model.
+
+### Step 1: Run GRU_Experimentation/test_directional_accuracy.py
+This script outputs the directional accuracy as well as R^2 metrics on our test set. These are the 2 metrics we care most about.
+
+### Step 2: Run GRU_Experimentation/Assess_Predictions.py
+This script prints out individual predictions and true labels starting from a random index in the test set. Repeatedly type "y" into the terminal to see the next prediction. When you are finished, press "n".
+
+### Step 3: Run GRU_Experimentation/PnL.py
+This script runs a profit and loss simulation where our model's predictions are used to make simulated trades. After you run this script, the first graph that shows up is simply to verify time-alignment of the denoised test set data that we load in, and the raw test set data without any preprocessing. This graph simply verifies that the X data and Y labels are aligned in time. You may close this graph immediately.
+
+Next, a graph showing the equity over time is shown. By default, there is a 0% spread and 0% fee coded into the script. You may increase these non-idealities to make a more realistic simulation by changing the simulation parameters SLIPPAGE_BP and FEE_BP in lines 41 and 42 respectively. 
+
+That's it!
+
+
+
+
 ## Project Structure & File Descriptions
 
 ### 1. Data Processing (`Data Processing/`)
@@ -199,115 +230,4 @@ This folder contains an auxiliary experiment that modifies the GRU training obje
 
 ---
 
-## How to Run
-
-### Prerequisites
-Install the required Python packages, for example via `pip`:
-
-```bash
-pip install torch numpy pandas matplotlib binance-connector pandas_ta scipy fastdtw
-```
-
-You may also need to install any additional packages referenced in the scripts (e.g., `tqdm` for progress bars).
-
-### Step 1: Prepare Raw & Generic Preprocessed Data
-
-From the project root:
-
-```bash
-cd "Data Processing"
-```
-
-1. **(Optional) Fetch new raw data** from Binance (requires API keys configured in `01_Retrieve_API_Data.py`):
-
-   ```bash
-   python 01_Retrieve_API_Data.py
-   ```
-
-   This produces raw CSVs such as `BTCUSDT_30m_10years.csv`.
-
-2. **Run the generic preprocessing pipeline** used by GRU/LSTM and the MLP baseline:
-
-   ```bash
-   python 02_Data_Preprocessing.py
-   ```
-
-   This generates:
-   - `preprocessed_data*.npz` in `Data Processing/`
-   - `mu_sigma_df.csv`, `column_names.csv`, `datapoint_timestamps.csv`
-   - `denoised_close_price_preview.png` for visual inspection.
-
-### Step 2: Train & Evaluate the Attention Model
-
-The Attention model uses its **own** preprocessing script in `Attention Model/` that reads the raw CSVs from `Data Processing/`.
-
-```bash
-cd "../Attention Model"
-```
-
-1. **Build encoder–decoder datasets for Attention:**
-
-   ```bash
-   python data_processing.py
-   ```
-
-   This creates `preprocessed_data*.npz` local to `Attention Model/`.
-
-2. **Train the Attention Seq2Seq model:**
-
-   ```bash
-   python training.py
-   ```
-
-   This will save `attention_model_best.pth` and `training_curves.png`.
-
-3. **Run advanced evaluation with prefix validation and k‑best selection:**
-
-   ```bash
-   python evaluation.py
-   ```
-
-   This produces `evaluation_results.npz` and `sample_predictions.png`.
-
-### Step 3: Train & Backtest GRU/LSTM Models
-
-From the project root:
-
-```bash
-cd "GRU_Experimentation"
-```
-
-1. **Train GRU / LSTM / EncoderGRU** using the generic preprocessed data:
-
-   ```bash
-   python GRU.py
-   ```
-
-   This writes `cur_best_model.pth` and `loss_curve.png`.
-
-2. **Interactively inspect predictions on the test set:**
-
-   ```bash
-   python Assess_Predictions.py
-   ```
-
-   Use the prompts to step through sequences and see true vs predicted values and running directional accuracy.
-
-3. **Run PnL backtest for the EncoderGRU strategy:**
-
-   ```bash
-   python PnL.py
-   ```
-
-   This creates `trades_log.csv` and `equity_curve.csv` and displays an equity‑curve plot.
-
-### Step 4: Run the MLP Baseline
-
-From the project root, after `preprocessed_data.npz` has been created by `02_Data_Preprocessing.py`:
-
-```bash
-python Skeleton_Neural_Net_Template.py
-```
-
-This will train the MLP baseline, evaluate it on the test set, and write plots and CSVs into the `artifacts/` folder.
 
