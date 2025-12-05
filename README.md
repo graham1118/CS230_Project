@@ -154,6 +154,24 @@ This folder explores simpler recurrent architectures (GRU, LSTM, and an EncoderG
     - `equity_curve.csv`: resulting equity curve over the backtest.
     - An equity‑curve plot (displayed via Matplotlib; can be saved/modified as needed).
 
+### 3.1 Directional Loss Experiment (`Directional_Loss_Experiment/`)
+
+This folder contains an auxiliary experiment that modifies the GRU training objective to better align with trading performance by explicitly penalizing direction errors.
+
+- **`train_directional.py`**
+  - **Purpose:** Train an `EncoderGRU` model using a **direction-weighted MSE** loss that multiplies the squared error by a factor \(1 + \alpha\) whenever the predicted sign of the return disagrees with the true sign.
+  - **Key details:**
+    - Uses the same preprocessed data as `GRU_Experimentation/GRU.py` (from `Data Processing/preprocessed_data.npz`).
+    - Model architecture: per‑timestep MLP encoder \(\rightarrow\) GRU \(\rightarrow\) LayerNorm \(\rightarrow\) linear head predicting a residual over the last normalized close log‑return.
+    - Loss: standard MSE when `sign(pred) == sign(target)`, and \((1+\alpha)\times\) MSE when the signs disagree (with \(\alpha = 10\) in our final run).
+  - **Result:** Achieves train/validation/test directional accuracies of **55.18% / 53.32% / 53.85%**, compared to \(\approx 50\%\) under a vanilla MSE objective, showing that loss design alone can yield a meaningful 3–4 percentage point gain in short‑horizon directional forecasting.
+
+- **`check_results.py`**
+  - **Purpose:** Convenience script to reload `directional_model.pth`, recompute train/val/test MSE and directional accuracy, and print a concise summary (used to generate the 55.18% / 53.32% / 53.85% figures).
+
+- **`direction_acc_curve.png`**
+  - **Purpose:** Visualization of validation directional accuracy over epochs for the direction‑weighted loss experiment, with a horizontal reference line at 50% to highlight the improvement over random guessing.
+
 ### 4. MLP Baseline & Artifacts
 
 - **`Skeleton_Neural_Net_Template.py`**
