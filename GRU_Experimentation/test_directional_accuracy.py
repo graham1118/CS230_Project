@@ -55,9 +55,11 @@ model.load_state_dict(checkpoint["model_state_dict"])
 model.to(device)
 model.eval()
 
-# Compute directional accuracy
+# Compute directional accuracy and R^2
 correct = 0
 total = 0
+all_preds = []
+all_targets = []
 
 with torch.no_grad():
     for xb, yb in zip(X_test_batches, Y_test_batches):
@@ -79,7 +81,21 @@ with torch.no_grad():
         correct += int((pred_sign[mask] == true_sign[mask]).sum().item())
         total += int(mask.sum().item())
 
+        # Collect for R^2
+        all_preds.append(pr_raw)
+        all_targets.append(yb_raw)
+
+# Calculate directional accuracy
 directional_accuracy = (correct / total) * 100 if total > 0 else 0
+
+# Calculate R^2
+all_preds = torch.cat(all_preds).cpu().numpy()
+all_targets = torch.cat(all_targets).cpu().numpy()
+ss_res = np.sum((all_targets - all_preds) ** 2)
+ss_tot = np.sum((all_targets - np.mean(all_targets)) ** 2)
+r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
 print(f"\n{'='*60}")
 print(f"Test Set Directional Accuracy: {directional_accuracy:.2f}% ({correct}/{total})")
+print(f"Test Set R²: {r2:.4f}")
 print(f"{'='*60}")
