@@ -44,7 +44,7 @@ EPOCHS = 20
 results_save_path = "exp_results.pkl"
 plot_save_path_suffix = "_loss_plot.jpg"
 
-NPZ_PATH = "preprocessed_data.npz"  # produced by your preprocessing script
+NPZ_PATH = "Data Processing/preprocessed_data.npz"  # produced by your preprocessing script
 
 # What to predict:
 #   "return" -> future log return: log( C_{t+h} / C_t )
