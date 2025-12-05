@@ -39,7 +39,7 @@ Scripts in this folder handle **raw data fetching and generic preprocessing** th
 > **Note:** The Attention model has its own preprocessing script in `Attention Model/data_processing.py` (see below) which reads the same CSVs but builds encoder–decoder style `(X, Y)` targets.
 
 ### 2. Attention Model (`Attention Model/`)
-This folder contains an encoder–decoder model with attention and its own preprocessing/training/evaluation pipeline.
+This folder contains an untested encoder–decoder model with attention and its own preprocessing/training/evaluation pipeline. This was purely for experimentation, and not part of the results for our project.
 
 - **`data_processing.py`**
   - **Purpose:** Build **seq2seq‑style** datasets specifically for the Attention model.
