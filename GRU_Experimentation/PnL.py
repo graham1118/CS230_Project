@@ -38,8 +38,8 @@ INIT_LEARNING_RATE = 1e-3
 # PnL sim params
 # -----------------------------
 START_BALANCE = 10_000.0
-SLIPPAGE_BP   = 0 #2
-FEE_BP        = 0 #2
+SLIPPAGE_BP   = 0 #Enter as a percentage, e.g. 1, 5, 10
+FEE_BP        = 0 #Enter as a percentage, e.g. 1, 5, 10
 TRADE_EVERY   = HORIZON
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
