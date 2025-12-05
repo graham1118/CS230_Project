@@ -7,6 +7,47 @@ import pandas_ta as ta
 import datetime as dt
 import time
 import sys
+from pytrends.request import TrendReq
+from datetime import datetime, timedelta
+
+
+
+#### GOOGLE TRENDS ####
+def fetch_bitcoin_trends(L):
+    """
+    Fetch daily Google Trends data for 'Bitcoin' and expand to hourly frequency.
+
+    Args:
+        L: Length of hourly dataframe to match
+
+    Returns:
+        pd.Series of length L with piecewise constant daily values repeated hourly
+    """
+    pytrends = TrendReq(hl='en-US', tz=360)
+
+    # Calculate how many days we need
+    n_days = L // 24
+
+    # Fetch trends data (Google Trends max is ~270 days for daily data)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=n_days)
+
+    pytrends.build_payload(['Bitcoin'], timeframe=f'{start_date.strftime("%Y-%m-%d")} {end_date.strftime("%Y-%m-%d")}')
+    trends_df = pytrends.interest_over_time()
+
+    # Get Bitcoin column and take first n_days
+    daily_values = trends_df['Bitcoin'].values[:n_days]
+
+    # Repeat each daily value 24 times for hourly frequency
+    hourly_values = np.repeat(daily_values, 24)
+
+    # Handle remaining samples by repeating the last value
+    remainder = L - len(hourly_values)
+    if remainder > 0:
+        hourly_values = np.concatenate([hourly_values, np.repeat(daily_values[-1], remainder)])
+
+    return pd.Series(hourly_values[:L])
+
 
 # === 1. Initialize API client ===
 key_name = "cs230_project"

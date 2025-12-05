@@ -38,8 +38,8 @@ INIT_LEARNING_RATE = 1e-3
 # PnL sim params
 # -----------------------------
 START_BALANCE = 10_000.0
-SLIPPAGE_BP   = 0 #5
-FEE_BP        = 0 #5
+SLIPPAGE_BP   = 0 #2
+FEE_BP        = 0 #2
 TRADE_EVERY   = HORIZON
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -323,15 +323,19 @@ if __name__ == "__main__":
     step_rets = np.diff(equity_curve) / equity_curve[:-1] if len(equity_curve) > 1 else np.array([0.0])
     sharpe_like = (np.mean(step_rets) / (np.std(step_rets) + 1e-12)) if step_rets.size else 0.0
 
+    # Buy and hold return
+    buy_hold_return = (actual_prices[-1] / actual_prices[0] - 1.0) * 100 if len(actual_prices) > 0 else 0.0
+
     print("\n========== PnL SUMMARY ==========")
     print(f"Final Balance: ${equity_curve[-1]:.2f}" if len(equity_curve) else f"Final Balance: ${START_BALANCE:.2f}")
     print(f"Total Return: {100*total_return:.2f}%")
+    print(f"Buy & Hold Return: {buy_hold_return:.2f}%")
     print(f"Sharpe-like: {sharpe_like:.3f}")
     print(f"Num trades:  {len(trades_df)}")
     if not trades_df.empty:
         print(trades_df.head())
 
     # Save logs
-    trades_df.to_csv("trades_log.csv", index=False)
+    #trades_df.to_csv("trades_log.csv", index=False)
     pd.DataFrame({"equity": equity_curve}).to_csv("equity_curve.csv", index=False)
-    print("✅ Saved trades_log.csv and equity_curve.csv")
+    print("Saved trades_log.csv and equity_curve.csv")

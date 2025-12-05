@@ -7,6 +7,8 @@ import sys
 import matplotlib.pyplot as plt
 import pywt
 from scipy.signal import lfilter, butter
+from datetime import datetime, timedelta
+from sklearn.preprocessing import StandardScaler
 
 ### Parameters ###
 SEED = 42
@@ -15,8 +17,10 @@ rng = np.random.default_rng(seed=SEED)
 #### Can be any combination of True/False ####
 COMBINE_DATA = False
 BLOCK_SHUFFLE = False 
+TREND_WEIGHT = 3
 DENOISE = True
 SMOOTH_FACTOR = 100    #observation noise is N times larger than process noise. for denoising
+
 
 BLOCK_SIZE = 2048
 HORIZON = 2
@@ -24,10 +28,11 @@ EPS = 1e-8
 TA_LENGTH = 14 #technical indicator window for TA library functions
 SELECT_RANGE = False #used if you want to select a later range of the data, rather than all of it
 USE_MACD = True
-SEQ_LEN = 16
+SEQ_LEN = 32
 train_frac, val_frac, test_frac = 0.9, 0.05, 0.05
 batch_size = 256  # must be power of 2 for efficient training
 #############################################
+
 
 
 
@@ -108,6 +113,8 @@ def kalman_denoise_multifeature(
 
 
     X = np.asarray(X, dtype=np.float32)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1) #turns (X,) into (X,1)
     n, m = X.shape
     out = np.zeros_like(X)
 
@@ -139,6 +146,22 @@ def kalman_denoise_multifeature(
  - DO NOT denoise technical indicators - they are already pretty smooth
 """
 
+#### Plotting Function ####
+def plot_features(df, cols_to_plot, window_size=1000, title_suffix=''):
+    """Plot specified columns from dataframe in a random window."""
+    start_idx = np.random.randint(0, len(df) - window_size)
+    window_slice = slice(start_idx, start_idx + window_size)
+    plt.figure(figsize=(14, 8))
+    for col in cols_to_plot:
+        plt.plot(df[col].iloc[window_slice].values, label=col, linewidth=1.5, alpha=0.8)
+    plt.title(f'{title_suffix} (Window: {window_slice.start}-{window_slice.stop})', fontsize=14)
+    plt.xlabel('Sample Index', fontsize=12)
+    plt.ylabel('Value', fontsize=12)
+    plt.legend(loc='best', fontsize=10)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
 #### Initial Data Processing ####
 def load_data(fname):
     df = pd.read_csv(fname)
@@ -157,7 +180,175 @@ def load_data(fname):
     
     return df
 
-def process_columns(df):
+
+#### GOOGLE TRENDS ####
+def fetch_bitcoin_trends(L):
+    """
+    Fetch daily Google Trends data for 'Bitcoin' and expand to hourly frequency.
+
+    Args:
+        L: Length of hourly dataframe to match
+
+    Returns:
+        pd.Series of length L with piecewise constant daily values repeated hourly
+    """
+    pytrends = TrendReq(hl='en-US', tz=360)
+
+    # Calculate how many days we need
+    n_days = L // 24
+
+    # Fetch trends data (Google Trends max is ~270 days for daily data)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=n_days)
+
+    pytrends.build_payload(['Bitcoin'], timeframe=f'{start_date.strftime("%Y-%m-%d")} {end_date.strftime("%Y-%m-%d")}')
+    trends_df = pytrends.interest_over_time()
+
+    # Get Bitcoin column and take first n_days
+    daily_values = trends_df['Bitcoin'].values[:n_days]
+
+    # Repeat each daily value 24 times for hourly frequency
+    hourly_values = np.repeat(daily_values, 24)
+
+    # Handle remaining samples by repeating the last value
+    remainder = L - len(hourly_values)
+    if remainder > 0:
+        hourly_values = np.concatenate([hourly_values, np.repeat(daily_values[-1], remainder)])
+
+    return pd.Series(hourly_values[:L])
+
+
+
+### funcs I added ################
+def zigzag(series, percent=0.02):
+    """
+    TradingView-style ZigZag with linear interpolation between pivot points.
+    percent = reversal threshold (0.02 = 2%)
+    """
+    s = series.values
+    idx = series.index
+    n = len(s)
+
+    if n < 3:
+        return series.copy()
+
+    pivots = np.full(n, np.nan)
+    last_pivot = 0
+    last_pivot_price = s[0]
+    direction = 0  # +1 uptrend, -1 downtrend
+
+    for i in range(1, n):
+        change = (s[i] - last_pivot_price) / last_pivot_price
+
+        if direction == 0:
+            if change > percent:
+                direction = +1
+                last_pivot = i
+                last_pivot_price = s[i]
+                pivots[i] = s[i]
+            elif change < -percent:
+                direction = -1
+                last_pivot = i
+                last_pivot_price = s[i]
+                pivots[i] = s[i]
+
+        elif direction == +1:
+            if s[i] > last_pivot_price:   # new high continues trend
+                last_pivot = i
+                last_pivot_price = s[i]
+            elif change < -percent:       # down reversal
+                direction = -1
+                last_pivot = i
+                last_pivot_price = s[i]
+                pivots[i] = s[i]
+
+        elif direction == -1:
+            if s[i] < last_pivot_price:   # new low continues trend
+                last_pivot = i
+                last_pivot_price = s[i]
+            elif change > percent:        # up reversal
+                direction = +1
+                last_pivot = i
+                last_pivot_price = s[i]
+                pivots[i] = s[i]
+
+    # ---- NOW PERFORM LINEAR INTERPOLATION BETWEEN PIVOTS ----
+    zigzag = pd.Series(np.nan, index=idx)
+
+    # get pivot indices
+    pivot_idx = np.where(~np.isnan(pivots))[0]
+
+    if len(pivot_idx) < 2:
+        # not enough pivots -> no zigzag possible
+        return series.copy()
+
+    for j in range(len(pivot_idx) - 1):
+        a = pivot_idx[j]
+        b = pivot_idx[j + 1]
+
+        y0 = pivots[a]
+        y1 = pivots[b]
+
+        # linear interpolation from pivot a to pivot b
+        steps = b - a
+        if steps <= 0:
+            continue
+
+        line = np.linspace(y0, y1, steps + 1)
+        zigzag.iloc[a:b+1] = line
+
+    # Fill start/end if needed
+    zigzag.iloc[:pivot_idx[0]] = pivots[pivot_idx[0]]
+    zigzag.iloc[pivot_idx[-1]:] = pivots[pivot_idx[-1]]
+
+    return zigzag
+
+def feature_engineer2(df):
+    #trends = fetch_bitcoin_trends(df.shape[0])
+
+    print("\n\nBefore Processing: df.shape")
+
+    df["close"] = kalman_denoise_multifeature(df["close"])
+    df["zigzag"] = zigzag(df["close"])
+    df = df.ffill() #get rid of NaNs
+
+    scaler = StandardScaler() 
+    df_scaled = pd.DataFrame(scaler.fit_transform(df), index=df.index, columns=df.columns)
+    
+    plot_features(df_scaled, cols_to_plot=df.columns.to_list())
+
+    w_close, w_vol, w_RSI, w_zig, w_trends = 1, 1, 1, 2, 2
+    weights = pd.Series([w_close, w_vol, w_RSI, w_zig, w_trends], index=df.columns)
+    df_weighted = df * weights
+    # UNCOMMENT if loading in original BTCUSDT_30m_10years.csv dataset
+    #df = df.drop(columns=["open","high","low","number_of_trades","BBL_20_2.0_2.0","BBM_20_2.0_2.0","BBU_20_2.0_2.0","BBB_20_2.0_2.0","BBP_20_2.0_2.0"])
+    
+    
+    df.to_csv("new_features_df.csv")
+
+    # Compute log returns: all OHLC relative to previous close price
+    df[["close", "RSI_14", "zigzag"]] = np.log(df[["close", "RSI_14", "zigzag"]] + 1e-8).diff().fillna(0)
+   
+
+    ### REMOVE UN-NEEDED COLUMNS ###
+    close_times = df.index
+    close_times.to_frame().to_csv('datapoint_timestamps.csv', index=True, header=True)
+    close_idx = df.columns.get_loc('close')
+
+    # Convert datetime to milliseconds for fast numpy operations
+    timestamps = close_times.astype(np.int64) // 10**6  # Convert to milliseconds
+
+
+    
+    print("\n\nAfter Processing")
+    print(df.head())
+
+    return df.to_numpy(), df.columns.tolist(), close_idx, timestamps
+################
+
+
+
+def feature_engineer1(df):
     # Bollander Band Width and Position
     df['BB_width'] =  (df['BBU_20_2.0_2.0'] - df['BBL_20_2.0_2.0']) / (df['BBM_20_2.0_2.0'] + 1e-8)
     df['BB_position'] = (df['close'] - df['BBL_20_2.0_2.0']) / (df['BBU_20_2.0_2.0'] - df['BBL_20_2.0_2.0'] + 1e-8)
@@ -184,32 +375,15 @@ def process_columns(df):
             trim = n_original - n_denoised
             df = df.iloc[trim:].reset_index(drop=True)
             original_close = original_close.iloc[trim:].reset_index(drop=True)
-            denoised_OHLC = denoised_OHLC[-len(df):]  # trim equally from denoised array
+            denoised_OHLC = denoised_OHLC[-len(df):,:]  # trim equally from denoised array
 
-        # ✅ Replace the first 4 columns with the denoised values
+        # Replace the first 4 columns with the denoised values
+        print(df.shape, denoised_OHLC.shape)
         df.iloc[:, :4] = denoised_OHLC
 
         # Visualize denoising effect on close price (random 1000-point window)
-        if len(df) > 1000:
-            start_idx = np.random.randint(0, len(df) - 1000)
-            window_slice = slice(start_idx, start_idx + 1000)
-        else:
-            window_slice = slice(0, len(df))
-
-        plt.figure(figsize=(14, 6))
-        plt.plot(original_close.iloc[window_slice].values, label='Original Close Price', linewidth=1, alpha=0.6, color='gray')
-        plt.plot(df.iloc[window_slice, 3].values, label='Denoised Close Price (Kalman)', linewidth=1.5, alpha=0.9, color='blue')
-        plt.title(f'Denoising Effect on Close Price (Random {len(df.iloc[window_slice])} datapoints, BEFORE log returns)\nSmoothing Factor: {SMOOTH_FACTOR}', fontsize=14)
-        plt.xlabel('Sample Index', fontsize=12)
-        plt.ylabel('Price (USD)', fontsize=12)
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.5)
-        plt.tight_layout()
-        plt.savefig('denoised_close_price_preview.png', dpi=150, bbox_inches='tight')
-        print(f"\n📊 Saved denoising comparison to: denoised_close_price_preview.png")
-        print(f"   Window: samples {window_slice.start} to {window_slice.stop}")
-        print(f"   Smoothing factor: {SMOOTH_FACTOR} (Q/R ratio: {2e-4 / (2e-4 * SMOOTH_FACTOR):.4f})\n")
-        plt.show()
+    print(df.columns)
+    plot_features(df, cols_to_plot=["close"])
 
     # # Check for negative values in the first 4 columns
     neg_mask = (df.iloc[:, :4] < 0)
@@ -243,7 +417,7 @@ def process_columns(df):
     close_idx = df.columns.get_loc('log_return_close')
     print(f"Columns After Processing: {df.columns.tolist()}\n\n")
 
-    return df.columns.tolist(), arr, close_idx, timestamps
+    return arr, df.columns.tolist(), close_idx, timestamps
 
 
 #### Functions for Shuffling ####
@@ -477,21 +651,25 @@ if __name__ == '__main__':
     # 1) Load data from CSV
     # ============================================================
     df = load_data('BTCUSDT_30m_10years.csv')
+    #df = pd.read_csv("new_features_df.csv", index_col='close_time', parse_dates=['close_time'])
 
     if COMBINE_DATA:
         df2 = load_data('ETHUSDT_30m_10years.csv')
-
-    
 
 
     # ============================================================
     # 2) Add New Technical Indicators and compute log returns
     # ============================================================
-    col_names, arr, close_idx, timestamps = process_columns(df)
+
+    
+    arr, col_names, close_idx, timestamps = feature_engineer1(df)
+   
     NUM_FEATURES = arr.shape[1]
 
+
     if COMBINE_DATA:
-        col_names2, arr2, _, timestamps2 = process_columns(df2)
+        arr2, col_names2, _, timestamps2 = feature_engineer2(df2)
+      
 
     # print("stopping here to check data shapes... can comment out sys.exit(0) to continue to training")
     # sys.exit(0)
@@ -574,13 +752,15 @@ if __name__ == '__main__':
             timestamps_test = np.concatenate((timestamps_test, timestamps_test2), axis=0)
 
 
-
+        ## SEQUENCE DATA
         print("Starting Sequencing...")
         X_train, Y_train, X_train_ts, Y_train_ts = sequence(train, SEQ_LEN, HORIZON, close_idx, timestamps_train)
         X_val, Y_val, X_val_ts, Y_val_ts = sequence(val, SEQ_LEN, HORIZON, close_idx, timestamps_val)
         X_test, Y_test, X_test_ts, Y_test_ts = sequence(test, SEQ_LEN, HORIZON, close_idx, timestamps_test)
+        print("3 Train sequencing complete!")
 
-       
+
+        ## Normalize DATA
         X_train, X_val, X_test, mu_x, sigma_x = normalize_wrt_train(X_train, X_val, X_test)
         verify_normalization(X_train, X_val, X_test) #prints out summary
 
@@ -591,11 +771,6 @@ if __name__ == '__main__':
         })
         mu_sigma_df.to_csv('mu_sigma_df.csv', index=False)
         print("Saved normalization statistics to mu_sigma_df.csv")
-
-        print(Y_train.shape)
-        
-        idx = np.random.choice(Y_train.shape[0], size=20, replace=False)
-        print(Y_train[idx])
 
     
 
@@ -711,3 +886,15 @@ if __name__ == '__main__':
 # plt.grid(True, linestyle='--', alpha=0.5)
 # plt.tight_layout()
 # plt.show()
+
+
+
+#TODO: 
+
+# ADD AS LITTLE EXTRA CODE AS POSSIBLE: rely on my current code and functionality, but simply re-organize and re-parameterize it.
+# - turn log returns into its own function
+# - parameterize/edit denoise function 
+# - Edits to 01_Retrive_API_Data.py
+#     - package code functionality into individual helper functions that are called. Logically organize code into functions
+#     - move fetch_google_trends() from 02_Data_Processing to the 01_Retrive_API_Data
+#     - add top-level boolean parameter INCLUDE_GOOGLE_TRENDS 
