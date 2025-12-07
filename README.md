@@ -10,7 +10,7 @@ This project implements and compares multiple deep learning architectures (Atten
 Install the required Python packages, for example via `pip`:
 
 ```bash
-pip install torch numpy pandas matplotlib binance-connector pandas_ta scipy fastdtw
+pip install -r requirements.txt
 ```
 
 
