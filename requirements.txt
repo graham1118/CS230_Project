@@ -1,0 +1,23 @@
+# Core Scientific Computing
+numpy
+pandas
+matplotlib
+
+# Deep Learning Framework
+torch
+
+# Data Source and API
+binance-connector
+python-binance
+
+# Technical Analysis
+pandas-ta
+
+# Google Trends Data
+pytrends
+
+# Signal Processing (for Kalman filtering / wavelets)
+pywt
+
+# Progress Bars
+tqdm
